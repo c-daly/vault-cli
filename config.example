@@ -1,0 +1,8 @@
+# Vault CLI configuration
+# Copy to ~/.config/vault-cli/config and edit
+
+# Path to your Obsidian vault (required)
+VAULT_DIR="/mnt/c/Users/cddal/Obsidian/vault"
+
+# Editor to use (defaults to $EDITOR or nvim)
+# VAULT_EDITOR="nvim"

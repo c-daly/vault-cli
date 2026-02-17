@@ -1,0 +1,569 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+# --- Config ---
+VAULT_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/vault-cli/config"
+if [[ -f "$VAULT_CONFIG" ]]; then
+    source "$VAULT_CONFIG"
+fi
+
+VAULT_DIR="${VAULT_DIR:-}"
+EDITOR="${VAULT_EDITOR:-${EDITOR:-nvim}}"
+
+if [[ -z "$VAULT_DIR" ]]; then
+    echo "Error: VAULT_DIR not set. Run setup.sh or set VAULT_DIR in $VAULT_CONFIG" >&2
+    exit 1
+fi
+
+if [[ ! -d "$VAULT_DIR" ]]; then
+    echo "Error: VAULT_DIR '$VAULT_DIR' does not exist" >&2
+    exit 1
+fi
+
+# --- Helpers ---
+vault_date() { date +%Y-%m-%d; }
+vault_time() { date +%H:%M; }
+vault_hostname() { hostname -s 2>/dev/null || hostname; }
+
+# --- Subcommands ---
+
+cmd_help() {
+    cat <<'HELP'
+Usage: vault <command> [options]
+
+Commands:
+  add <text> [-t type]   Quick capture to today's daily file
+  process [date]         Review and categorize captures
+  process --commit       Split categorized entries into notes
+  edit [-t type]         Create note from template, open in editor
+  daily                  Create/open today's daily note
+  search <query>         Search vault with fzf + ripgrep
+  sync                   Git commit + pull + push
+  harvest [--all] [--project <name>]  Import Claude Code sessions
+  recent [N]             Show recently modified notes (default: 10)
+  help                   Show this help
+HELP
+}
+
+cmd_add() {
+    local category=""
+    local text=""
+
+    # Parse args
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -t|--type) category="$2"; shift 2 ;;
+            *)
+                if [[ -n "$text" ]]; then
+                    text="$text $1"
+                else
+                    text="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$text" ]]; then
+        echo "Usage: vault add <text> [-t type]" >&2
+        exit 1
+    fi
+
+    local today
+    today="$(vault_date)"
+    local now
+    now="$(vault_time)"
+    local capture_file="$VAULT_DIR/00-inbox/$today.md"
+
+    mkdir -p "$VAULT_DIR/00-inbox"
+
+    {
+        echo ""
+        echo "## $now"
+        echo "$text"
+        if [[ -n "$category" ]]; then
+            echo "> $category"
+        fi
+    } >> "$capture_file"
+
+    echo "Captured to $today.md at $now"
+}
+cmd_process() {
+    local target_date=""
+    local do_commit=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --commit) do_commit=true; shift ;;
+            *) target_date="$1"; shift ;;
+        esac
+    done
+    [[ -z "$target_date" ]] && target_date="$(vault_date)"
+
+    local capture_file="$VAULT_DIR/00-inbox/$target_date.md"
+
+    if [[ ! -f "$capture_file" ]]; then
+        echo "No capture file for $target_date"
+        return 0
+    fi
+
+    if $do_commit; then
+        _process_commit "$capture_file" "$target_date"
+    else
+        "$EDITOR" "$capture_file"
+    fi
+}
+
+_process_commit() {
+    local capture_file="$1"
+    local target_date="$2"
+    local count=0
+    local current_time="" current_text="" current_category=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^##\ ([0-9]{2}:[0-9]{2}) ]]; then
+            # Save previous entry if exists
+            if [[ -n "$current_text" ]]; then
+                _create_note_from_entry "$current_text" "$current_category" "$target_date" "$current_time"
+                count=$((count + 1))
+            fi
+            current_time="${match[1]}"
+            current_text=""
+            current_category=""
+        elif [[ "$line" == '> '* ]]; then
+            local tag="${line#> }"
+            if [[ "$tag" == '?'* ]]; then
+                # Unconfirmed category — skip this entry
+                echo "Skipping unconfirmed entry at $current_time (category: $tag)"
+                current_text=""
+            else
+                # Confirmed category
+                current_category="$tag"
+            fi
+        elif [[ -n "$current_time" ]]; then
+            if [[ -n "$current_text" ]]; then
+                current_text="$current_text
+$line"
+            else
+                current_text="$line"
+            fi
+        fi
+    done < "$capture_file"
+
+    # Handle last entry
+    if [[ -n "$current_text" ]]; then
+        _create_note_from_entry "$current_text" "$current_category" "$target_date" "$current_time"
+        count=$((count + 1))
+    fi
+
+    echo "Created $count notes from $target_date captures"
+
+    if [[ $count -gt 0 ]]; then
+        local archive_dir="$VAULT_DIR/40-archive/daily-captures"
+        mkdir -p "$archive_dir"
+        mv "$capture_file" "$archive_dir/$target_date.md"
+        echo "Archived capture file to $archive_dir/$target_date.md"
+    fi
+}
+
+_create_note_from_entry() {
+    local text="$1"
+    local category="${2:-fleeting}"
+    local entry_date="$3"
+    local entry_time="$4"
+
+    # Trim empty lines
+    text=$(echo "$text" | sed '/^$/d')
+    [[ -z "$text" ]] && return
+
+    local dest_dir
+    case "$category" in
+        project)   dest_dir="$VAULT_DIR/10-projects" ;;
+        learning)  dest_dir="$VAULT_DIR/30-resources" ;;
+        fleeting|*) dest_dir="$VAULT_DIR/00-inbox" ;;
+    esac
+
+    local first_line
+    first_line=$(echo "$text" | head -1)
+    local filename
+    filename=$(echo "$first_line" | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-' | cut -c1-60)
+    [[ -z "$filename" ]] && filename="note-$entry_date-$entry_time"
+    local note_file="$dest_dir/$filename.md"
+
+    # Avoid overwriting
+    if [[ -f "$note_file" ]]; then
+        note_file="$dest_dir/${filename}-${entry_time}.md"
+    fi
+
+    mkdir -p "$dest_dir"
+
+    cat > "$note_file" <<EOF
+---
+created: $entry_date
+type: $category
+---
+
+# $first_line
+
+$text
+
+EOF
+
+    echo "  -> $note_file"
+}
+cmd_edit() {
+    local note_type=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -t|--type) note_type="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+
+    # Prompt for type if not given
+    if [[ -z "$note_type" ]]; then
+        echo "Note type:"
+        echo "  1) fleeting"
+        echo "  2) project"
+        echo "  3) learning"
+        read -r "choice?> "
+        case "$choice" in
+            1|fleeting)  note_type="fleeting" ;;
+            2|project)   note_type="project" ;;
+            3|learning)  note_type="learning" ;;
+            *) echo "Invalid choice"; exit 1 ;;
+        esac
+    fi
+
+    local dest_dir
+    case "$note_type" in
+        fleeting)  dest_dir="$VAULT_DIR/00-inbox" ;;
+        project)   dest_dir="$VAULT_DIR/10-projects" ;;
+        learning)  dest_dir="$VAULT_DIR/30-resources" ;;
+        *) dest_dir="$VAULT_DIR/00-inbox" ;;
+    esac
+
+    local today
+    today="$(vault_date)"
+    local template="$VAULT_DIR/_templates/$note_type.md"
+
+    read -r "title?Title: "
+    if [[ -z "$title" ]]; then
+        title="Untitled $(vault_date) $(vault_time)"
+    fi
+
+    local filename
+    filename="$(echo "$title" | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')"
+    local note_file="$dest_dir/$filename.md"
+
+    mkdir -p "$dest_dir"
+
+    if [[ -f "$template" ]]; then
+        sed -e "s/{{date:YYYY-MM-DD}}/$today/g" \
+            -e "s/{{date}}/$today/g" \
+            -e "s/{{title}}/$title/g" \
+            "$template" > "$note_file"
+    else
+        cat > "$note_file" <<EOF
+---
+created: $today
+type: $note_type
+---
+
+# $title
+
+EOF
+    fi
+
+    "$EDITOR" "$note_file"
+    echo "Created: $note_file"
+}
+cmd_daily() {
+    local today
+    today="$(vault_date)"
+    local daily_file="$VAULT_DIR/journal/$today.md"
+    local template="$VAULT_DIR/_templates/daily.md"
+
+    mkdir -p "$VAULT_DIR/journal"
+
+    if [[ ! -f "$daily_file" ]]; then
+        if [[ -f "$template" ]]; then
+            sed -e "s/{{date:YYYY-MM-DD}}/$today/g" \
+                -e "s/{{date}}/$today/g" \
+                -e "s/{{title}}/$today/g" \
+                "$template" > "$daily_file"
+        else
+            cat > "$daily_file" <<EOF
+---
+created: $today
+type: daily
+---
+
+# $today
+
+## Today's Focus
+
+
+## Notes & Ideas
+
+
+## Reflections
+
+EOF
+        fi
+        echo "Created daily note: $daily_file"
+    fi
+
+    "$EDITOR" "$daily_file"
+}
+cmd_recent() {
+    local count="${1:-10}"
+
+    cd "$VAULT_DIR"
+    echo "Recently modified notes:"
+    echo ""
+    # Show recent git file changes with relative timestamps
+    { git log --diff-filter=ACMR --name-only --format="%ar" -- '*.md' 2>/dev/null || true; } \
+        | awk -v max="$count" '
+            /ago/ { timestamp = $0; next }
+            NF && !seen[$0]++ { printf "  %-20s %s\n", timestamp, $0; n++; if (n >= max) exit }
+        ' || true
+
+    echo ""
+    echo "Today's captures:"
+    local today_file="$VAULT_DIR/00-inbox/$(vault_date).md"
+    if [[ -f "$today_file" ]]; then
+        grep '^## ' "$today_file" 2>/dev/null | while IFS= read -r line; do
+            echo "  $line"
+        done
+    else
+        echo "  (none)"
+    fi
+}
+
+cmd_search() {
+    local query="${*:-}"
+
+    if ! command -v rg &>/dev/null; then
+        echo "Error: ripgrep (rg) is required for search" >&2
+        exit 1
+    fi
+    if ! command -v fzf &>/dev/null; then
+        echo "Error: fzf is required for search" >&2
+        exit 1
+    fi
+
+    local selected
+    if [[ -n "$query" ]]; then
+        selected=$(
+            rg --files-with-matches --no-messages "$query" "$VAULT_DIR" \
+                --glob '!.git' --glob '!.obsidian' --glob '!.vault-cli' |
+            fzf --preview "rg --context 3 --color=always '$query' {}" \
+                --preview-window=right:60%:wrap \
+                --query "$query"
+        ) || return 0
+    else
+        selected=$(
+            rg --files "$VAULT_DIR" \
+                --glob '!.git' --glob '!.obsidian' --glob '!.vault-cli' |
+            fzf --preview "head -40 {}" \
+                --preview-window=right:60%:wrap
+        ) || return 0
+    fi
+
+    if [[ -n "$selected" ]]; then
+        "$EDITOR" "$selected"
+    fi
+}
+cmd_sync() {
+    local hostname
+    hostname="$(vault_hostname)"
+    local timestamp
+    timestamp="$(date +%Y-%m-%d-%H%M)"
+
+    cd "$VAULT_DIR"
+
+    if [[ -n "$(git status --porcelain)" ]]; then
+        git add -A
+        git commit -m "vault sync $hostname $timestamp"
+        echo "Committed changes"
+    else
+        echo "No local changes to commit"
+    fi
+
+    if git remote get-url origin &>/dev/null; then
+        echo "Pulling..."
+        git pull --rebase || {
+            echo "Error: rebase conflict. Resolve manually in $VAULT_DIR" >&2
+            exit 1
+        }
+        echo "Pushing..."
+        git push
+        echo "Synced."
+    else
+        echo "No remote configured — skipping push/pull"
+    fi
+}
+cmd_harvest() {
+    local harvest_all=false
+    local project_filter=""
+    local do_sync=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all) harvest_all=true; shift ;;
+            --project) project_filter="$2"; shift 2 ;;
+            --sync) do_sync=true; shift ;;
+            *) echo "Unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    if ! command -v jq &>/dev/null; then
+        echo "Error: jq is required for harvest. Install with: sudo apt install jq" >&2
+        exit 1
+    fi
+
+    local claude_dir="$HOME/.claude/projects"
+    if [[ ! -d "$claude_dir" ]]; then
+        echo "No Claude Code projects found at $claude_dir"
+        return 0
+    fi
+
+    local state_file="$VAULT_DIR/.vault-harvest-state"
+    local output_dir="$VAULT_DIR/30-resources/claude-sessions"
+    local hostname
+    hostname="$(vault_hostname)"
+    local count=0
+
+    # Load previously harvested session IDs
+    typeset -A harvested
+    if [[ -f "$state_file" ]] && ! $harvest_all; then
+        while IFS= read -r sid; do
+            harvested[$sid]=1
+        done < "$state_file"
+    fi
+
+    # Process each project's session index
+    for index_file in "$claude_dir"/*/sessions-index.json; do
+        [[ -f "$index_file" ]] || continue
+
+        local project_dir="$(dirname "$index_file")"
+        local project_name="$(basename "$project_dir")"
+
+        # Apply project filter
+        if [[ -n "$project_filter" ]] && [[ "$project_name" != *"$project_filter"* ]]; then
+            continue
+        fi
+
+        # Extract all sessions as JSON lines for efficient processing
+        while IFS= read -r entry; do
+            local session_id summary first_prompt created modified
+            local git_branch project_path message_count full_path
+
+            session_id=$(echo "$entry" | jq -r '.sessionId // empty' 2>/dev/null) || continue
+            [[ -z "$session_id" ]] && continue
+
+            # Skip already harvested
+            if [[ -n "${harvested[$session_id]:-}" ]]; then
+                continue
+            fi
+
+            message_count=$(echo "$entry" | jq -r '.messageCount // 0' 2>/dev/null) || continue
+
+            # Skip trivial sessions
+            if [[ "$message_count" -le 2 ]] 2>/dev/null; then
+                echo "$session_id" >> "$state_file"
+                continue
+            fi
+
+            summary=$(echo "$entry" | jq -r '.summary // "No summary"' 2>/dev/null) || summary="No summary"
+            first_prompt=$(echo "$entry" | jq -r '.firstPrompt // ""' 2>/dev/null) || first_prompt=""
+            created=$(echo "$entry" | jq -r '.created // empty' 2>/dev/null) || continue
+            modified=$(echo "$entry" | jq -r '.modified // empty' 2>/dev/null) || modified=""
+            git_branch=$(echo "$entry" | jq -r '.gitBranch // ""' 2>/dev/null) || git_branch=""
+            project_path=$(echo "$entry" | jq -r '.projectPath // ""' 2>/dev/null) || project_path=""
+            full_path=$(echo "$entry" | jq -r '.fullPath // ""' 2>/dev/null) || full_path=""
+
+            # Calculate date and duration
+            local session_date session_time
+            session_date=$(date -d "$created" +%Y-%m-%d 2>/dev/null || echo "${created:0:10}")
+            session_time=$(date -d "$created" +%H:%M 2>/dev/null || echo "00:00")
+            local year_month="${session_date:0:7}"
+
+            local duration_min="?"
+            if [[ -n "$created" ]] && [[ -n "$modified" ]]; then
+                local start_epoch end_epoch
+                start_epoch=$(date -d "$created" +%s 2>/dev/null || echo 0)
+                end_epoch=$(date -d "$modified" +%s 2>/dev/null || echo 0)
+                if [[ "$start_epoch" -gt 0 ]] && [[ "$end_epoch" -gt 0 ]]; then
+                    duration_min=$(( (end_epoch - start_epoch) / 60 ))
+                fi
+            fi
+
+            # Readable project name from path
+            local readable_project
+            readable_project=$(echo "$project_path" | sed 's|.*/||')
+            [[ -z "$readable_project" ]] && readable_project="$project_name"
+
+            # Create output directory
+            local out_dir="$output_dir/$year_month"
+            mkdir -p "$out_dir"
+
+            local note_file="$out_dir/${session_date}-${session_id:0:8}.md"
+
+            # Build the note
+            {
+                echo "---"
+                echo "created: $session_date"
+                echo "type: claude-session"
+                echo "machine: $hostname"
+                echo "project: $project_path"
+                [[ -n "$git_branch" ]] && echo "branch: $git_branch"
+                echo "source: $full_path"
+                echo "session_id: $session_id"
+                echo "---"
+                echo ""
+                echo "# Claude Code Session — $session_date $session_time"
+                echo ""
+                echo "**Machine:** $hostname"
+                echo "**Project:** $readable_project (\`$project_path\`)"
+                [[ -n "$git_branch" ]] && echo "**Branch:** \`$git_branch\`"
+                echo "**Duration:** ${duration_min} min | **Messages:** $message_count"
+                echo "**Source:** \`$full_path\`"
+                echo ""
+                echo "## Summary"
+                echo "$summary"
+                echo ""
+                echo "## First Prompt"
+                echo "> $first_prompt"
+                echo ""
+                echo "## Related"
+                echo ""
+            } > "$note_file"
+
+            echo "$session_id" >> "$state_file"
+            count=$((count + 1))
+        done < <(jq -c '.entries[]' "$index_file" 2>/dev/null)
+    done
+
+    echo "Harvested $count new sessions"
+
+    if $do_sync; then
+        cmd_sync
+    fi
+}
+
+# --- Dispatch ---
+case "${1:-help}" in
+    add)      shift; cmd_add "$@" ;;
+    process)  shift; cmd_process "$@" ;;
+    edit)     shift; cmd_edit "$@" ;;
+    daily)    shift; cmd_daily "$@" ;;
+    search)   shift; cmd_search "$@" ;;
+    sync)     shift; cmd_sync "$@" ;;
+    harvest)  shift; cmd_harvest "$@" ;;
+    recent|log) shift; cmd_recent "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *) echo "Unknown command: $1. Run 'vault help' for usage." >&2; exit 1 ;;
+esac
