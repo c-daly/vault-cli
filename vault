@@ -469,6 +469,8 @@ cmd_harvest() {
     local session_id summary first_prompt created modified
     local git_branch project_path message_count full_path
     local project_dir project_name
+    local session_date session_time year_month duration_min
+    local start_epoch end_epoch readable_project out_dir note_file
     # Process each project's session index
     for index_file in "$claude_dir"/*/sessions-index.json; do
         [[ -f "$index_file" ]] || continue
@@ -509,14 +511,14 @@ cmd_harvest() {
             full_path=$(echo "$entry" | jq -r '.fullPath // ""' 2>/dev/null) || full_path=""
 
             # Calculate date and duration
-            local session_date session_time
+            session_date=""; session_time=""
             session_date=$(date -d "$created" +%Y-%m-%d 2>/dev/null || echo "${created:0:10}")
             session_time=$(date -d "$created" +%H:%M 2>/dev/null || echo "00:00")
-            local year_month="${session_date:0:7}"
+            year_month="${session_date:0:7}"
 
-            local duration_min="?"
+            duration_min="?"
             if [[ -n "$created" ]] && [[ -n "$modified" ]]; then
-                local start_epoch end_epoch
+                start_epoch=0; end_epoch=0
                 start_epoch=$(date -d "$created" +%s 2>/dev/null || echo 0)
                 end_epoch=$(date -d "$modified" +%s 2>/dev/null || echo 0)
                 if [[ "$start_epoch" -gt 0 ]] && [[ "$end_epoch" -gt 0 ]]; then
@@ -525,15 +527,15 @@ cmd_harvest() {
             fi
 
             # Readable project name from path
-            local readable_project
+            readable_project=""
             readable_project=$(echo "$project_path" | sed 's|.*/||')
             [[ -z "$readable_project" ]] && readable_project="$project_name"
 
             # Create output directory
-            local out_dir="$output_dir/$year_month"
+            out_dir="$output_dir/$year_month"
             mkdir -p "$out_dir"
 
-            local note_file="$out_dir/${session_date}-${session_id:0:8}.md"
+            note_file="$out_dir/${session_date}-${session_id:0:8}.md"
 
             # Build the note
             {
@@ -595,14 +597,13 @@ _collect_git_activity() {
             local author_flag=""
             [[ -n "$git_email" ]] && author_flag="--author=$git_email"
 
-            local log
             log=$(git -C "$repo" log $author_flag \
                 --after="${target_date}T00:00:00" \
                 --before="${target_date}T23:59:59" \
                 --pretty=format:"- %s (\`%h\`)" 2>/dev/null || true)
 
             if [[ -n "$log" ]]; then
-                local count=$(echo "$log" | wc -l | tr -d ' ')
+                count=$(echo "$log" | wc -l | tr -d ' ')
                 commit_count=$((commit_count + count))
                 output+="**$repo_name** ($count commits)\n$log\n\n"
             fi
@@ -632,7 +633,7 @@ _collect_shell_history() {
     local commands=()
     while IFS= read -r line; do
         if [[ "$line" =~ ^:\ ([0-9]+):[0-9]+\;(.+)$ ]]; then
-            local ts="${match[1]}" cmd="${match[2]}"
+            ts="${match[1]}" cmd="${match[2]}"
             if (( ts >= start_ts && ts <= end_ts )); then
                 commands+=("$cmd")
             fi
@@ -649,7 +650,7 @@ _collect_shell_history() {
     local -A cmd_counts
     local notable=()
     for cmd in "${commands[@]}"; do
-        local base="${cmd%% *}"
+        base="${cmd%% *}"
         case "$base" in
             ls|cd|pwd|clear|echo|cat|less|more) continue ;;
         esac
@@ -713,12 +714,12 @@ _collect_claude_sessions() {
     fi
 
     local session_count=0 output=""
+    local project_name sessions count time
 
     for index_file in "$CLAUDE_PROJECTS_DIR"/*/sessions-index.json(N); do
         [[ -f "$index_file" ]] || continue
-        local project_name=$(basename "$(dirname "$index_file")")
+        project_name=$(basename "$(dirname "$index_file")")
 
-        local sessions
         sessions=$(jq -r --arg date "$target_date" '
             .entries[]
             | select(.created
@@ -727,12 +728,12 @@ _collect_claude_sessions() {
         ' "$index_file" 2>/dev/null || true)
 
         if [[ -n "$sessions" ]]; then
-            local count=$(echo "$sessions" | wc -l | tr -d ' ')
+            count=$(echo "$sessions" | wc -l | tr -d ' ')
             session_count=$((session_count + count))
             output+="**$project_name** ($count sessions)\n"
 
             echo "$sessions" | while IFS=$'\t' read -r ts msgs branch; do
-                local time=$(echo "$ts" | sed 's/.*T//' | cut -d. -f1 | cut -d: -f1-2)
+                time=$(echo "$ts" | sed 's/.*T//' | cut -d. -f1 | cut -d: -f1-2)
                 output+="- $time — $msgs messages"
                 [[ "$branch" != "—" ]] && output+=" (branch: \`$branch\`)"
                 output+="\n"
@@ -853,8 +854,9 @@ cmd_weekly() {
     # Collect daily files
     local daily_files=()
     local current="$start_date"
+    local daily
     while [[ "$current" < "$end_date" || "$current" == "$end_date" ]]; do
-        local daily="$VAULT_DIR/journal/$current.md"
+        daily="$VAULT_DIR/journal/$current.md"
         [[ -f "$daily" ]] && daily_files+=("$daily")
         current=$(_date_offset "$current" +1)
     done
@@ -866,13 +868,14 @@ cmd_weekly() {
 
     # Extract stats
     local total_commits=0 total_sessions=0
+    local repo count proj dow
     local active_days=${#daily_files[@]}
     declare -A repo_commits project_sessions
 
     for file in "${daily_files[@]}"; do
         while IFS= read -r line; do
             if [[ "$line" =~ ^\*\*(.+)\*\*\ \(([0-9]+)\ commits\) ]]; then
-                local repo="${match[1]}" count="${match[2]}"
+                repo="${match[1]}" count="${match[2]}"
                 repo_commits[$repo]=$(( ${repo_commits[$repo]:-0} + count ))
                 total_commits=$((total_commits + count))
             fi
@@ -880,7 +883,7 @@ cmd_weekly() {
 
         while IFS= read -r line; do
             if [[ "$line" =~ ^\*\*(.+)\*\*\ \(([0-9]+)\ sessions?\) ]]; then
-                local proj="${match[1]}" count="${match[2]}"
+                proj="${match[1]}" count="${match[2]}"
                 project_sessions[$proj]=$(( ${project_sessions[$proj]:-0} + count ))
                 total_sessions=$((total_sessions + count))
             fi
@@ -929,7 +932,7 @@ cmd_weekly() {
         echo ""
         current="$start_date"
         while [[ "$current" < "$end_date" || "$current" == "$end_date" ]]; do
-            local dow=$(_date_fmt "$current" "+%A")
+            dow=$(_date_fmt "$current" "+%A")
             if [[ -f "$VAULT_DIR/journal/$current.md" ]]; then
                 echo "- [[$current|$dow]]"
             else
@@ -1003,13 +1006,14 @@ cmd_backfill() {
     mkdir -p "$VAULT_DIR/journal"
 
     local count=0
+    local dow month day recap_file inbox_file
     for target_date in "${sorted_dates[@]}"; do
         [[ "$target_date" > "$today" ]] && continue
 
-        local dow=$(_date_fmt "$target_date" "+%A")
-        local month=$(echo "$target_date" | cut -d- -f2)
-        local day=$(echo "$target_date" | cut -d- -f3)
-        local recap_file="$VAULT_DIR/journal/$target_date.md"
+        dow=$(_date_fmt "$target_date" "+%A")
+        month=$(echo "$target_date" | cut -d- -f2)
+        day=$(echo "$target_date" | cut -d- -f3)
+        recap_file="$VAULT_DIR/journal/$target_date.md"
 
         {
             echo "---"
@@ -1038,7 +1042,7 @@ cmd_backfill() {
 
             echo ""
             echo "## Inbox Captures"
-            local inbox_file="$VAULT_DIR/00-inbox/$target_date.md"
+            inbox_file="$VAULT_DIR/00-inbox/$target_date.md"
             if [[ -f "$inbox_file" ]]; then
                 cat "$inbox_file"
             else
