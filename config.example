@@ -6,3 +6,9 @@ VAULT_DIR="/mnt/c/Users/cddal/Obsidian/vault"
 
 # Editor to use (defaults to $EDITOR or nvim)
 # VAULT_EDITOR="nvim"
+
+# Recap: where to scan for git repos (colon-separated for multiple dirs)
+# VAULT_REPOS_DIR="$HOME/projects"
+
+# Recap: enable Google Calendar integration (requires gcalcli)
+# VAULT_GCAL_ENABLED="true"

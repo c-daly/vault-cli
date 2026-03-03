@@ -10,6 +10,12 @@ fi
 VAULT_DIR="${VAULT_DIR:-}"
 EDITOR="${VAULT_EDITOR:-${EDITOR:-nvim}}"
 
+# Recap/weekly config
+REPOS_DIR="${VAULT_REPOS_DIR:-$HOME/projects}"
+HIST_FILE="${HISTFILE:-$HOME/.zsh_history}"
+GCAL_ENABLED="${VAULT_GCAL_ENABLED:-true}"
+CLAUDE_PROJECTS_DIR="$HOME/.claude/projects"
+
 if [[ -z "$VAULT_DIR" ]]; then
     echo "Error: VAULT_DIR not set. Run setup.sh or set VAULT_DIR in $VAULT_CONFIG" >&2
     exit 1
@@ -24,6 +30,19 @@ fi
 vault_date() { date +%Y-%m-%d; }
 vault_time() { date +%H:%M; }
 vault_hostname() { hostname -s 2>/dev/null || hostname; }
+
+# Cross-platform date helpers (macOS vs Linux/WSL)
+if [[ "$(uname)" == "Darwin" ]]; then
+    _date_offset() { date -j -v"${2}d" -f "%Y-%m-%d" "$1" +%Y-%m-%d; }
+    _date_fmt()    { date -j -f "%Y-%m-%d" "$1" "$2"; }
+    _date_epoch()  { date -j -f "%Y-%m-%d %H:%M:%S" "$1" "+%s"; }
+    _date_yesterday() { date -v-1d +%Y-%m-%d; }
+else
+    _date_offset() { date -d "$1 ${2} days" +%Y-%m-%d; }
+    _date_fmt()    { date -d "$1" "$2"; }
+    _date_epoch()  { date -d "$1" "+%s"; }
+    _date_yesterday() { date -d "yesterday" +%Y-%m-%d; }
+fi
 
 # --- Subcommands ---
 
@@ -41,6 +60,9 @@ Commands:
   sync                   Git commit + pull + push
   harvest [--all] [--project <name>]  Import Claude Code sessions
   recent [N]             Show recently modified notes (default: 10)
+  recap [today|yesterday|DATE]  Auto-generate daily recap from activity
+  backfill                Generate recaps for all past dates with activity
+  weekly [end-date]      Weekly rollup from daily recaps
   help                   Show this help
 HELP
 }
@@ -444,12 +466,17 @@ cmd_harvest() {
         done < "$state_file"
     fi
 
+    local session_id summary first_prompt created modified
+    local git_branch project_path message_count full_path
+    local project_dir project_name
+    local session_date session_time year_month duration_min
+    local start_epoch end_epoch readable_project out_dir note_file
     # Process each project's session index
     for index_file in "$claude_dir"/*/sessions-index.json; do
         [[ -f "$index_file" ]] || continue
 
-        local project_dir="$(dirname "$index_file")"
-        local project_name="$(basename "$project_dir")"
+        project_dir="$(dirname "$index_file")"
+        project_name="$(basename "$project_dir")"
 
         # Apply project filter
         if [[ -n "$project_filter" ]] && [[ "$project_name" != *"$project_filter"* ]]; then
@@ -458,8 +485,6 @@ cmd_harvest() {
 
         # Extract all sessions as JSON lines for efficient processing
         while IFS= read -r entry; do
-            local session_id summary first_prompt created modified
-            local git_branch project_path message_count full_path
 
             session_id=$(echo "$entry" | jq -r '.sessionId // empty' 2>/dev/null) || continue
             [[ -z "$session_id" ]] && continue
@@ -486,14 +511,14 @@ cmd_harvest() {
             full_path=$(echo "$entry" | jq -r '.fullPath // ""' 2>/dev/null) || full_path=""
 
             # Calculate date and duration
-            local session_date session_time
+            session_date=""; session_time=""
             session_date=$(date -d "$created" +%Y-%m-%d 2>/dev/null || echo "${created:0:10}")
             session_time=$(date -d "$created" +%H:%M 2>/dev/null || echo "00:00")
-            local year_month="${session_date:0:7}"
+            year_month="${session_date:0:7}"
 
-            local duration_min="?"
+            duration_min="?"
             if [[ -n "$created" ]] && [[ -n "$modified" ]]; then
-                local start_epoch end_epoch
+                start_epoch=0; end_epoch=0
                 start_epoch=$(date -d "$created" +%s 2>/dev/null || echo 0)
                 end_epoch=$(date -d "$modified" +%s 2>/dev/null || echo 0)
                 if [[ "$start_epoch" -gt 0 ]] && [[ "$end_epoch" -gt 0 ]]; then
@@ -502,15 +527,15 @@ cmd_harvest() {
             fi
 
             # Readable project name from path
-            local readable_project
+            readable_project=""
             readable_project=$(echo "$project_path" | sed 's|.*/||')
             [[ -z "$readable_project" ]] && readable_project="$project_name"
 
             # Create output directory
-            local out_dir="$output_dir/$year_month"
+            out_dir="$output_dir/$year_month"
             mkdir -p "$out_dir"
 
-            local note_file="$out_dir/${session_date}-${session_id:0:8}.md"
+            note_file="$out_dir/${session_date}-${session_id:0:8}.md"
 
             # Build the note
             {
@@ -554,6 +579,653 @@ cmd_harvest() {
     fi
 }
 
+# --- Recap collectors ---
+
+_fetch_github_events_cache() {
+    local cache_file="/tmp/vault-github-events-$$.json"
+
+    # Return cache if already fetched this session
+    if [[ -f "$cache_file" ]]; then
+        echo "$cache_file"
+        return
+    fi
+
+    if ! command -v gh &>/dev/null; then
+        echo ""
+        return
+    fi
+    if ! gh auth status &>/dev/null 2>&1; then
+        echo ""
+        return
+    fi
+
+    local gh_user
+    gh_user=$(gh api user --jq .login 2>/dev/null) || { echo ""; return; }
+
+    # Fetch up to 10 pages of events
+    local page=1 count tmp_page="/tmp/vault-gh-page-$$.json"
+    echo "[]" > "$cache_file"
+    while [[ $page -le 10 ]]; do
+        gh api "/users/$gh_user/events?per_page=100&page=$page" > "$tmp_page" 2>/dev/null || break
+
+        count=$(jq 'length' "$tmp_page" 2>/dev/null) || break
+        [[ "$count" -eq 0 ]] && break
+
+        # Merge into cache
+        jq -s '.[0] + .[1]' "$cache_file" "$tmp_page" > "${cache_file}.tmp" && mv "${cache_file}.tmp" "$cache_file"
+
+        page=$((page + 1))
+    done
+    rm -f "$tmp_page"
+
+    echo "$cache_file"
+}
+
+_collect_github_activity() {
+    local target_date="$1"
+
+    local cache_file
+    cache_file=$(_fetch_github_events_cache)
+    [[ -z "$cache_file" || ! -f "$cache_file" ]] && return
+
+    local pr_output="" issue_output="" create_output="" review_output=""
+    local pr_count=0 issue_count=0 create_count=0 review_count=0
+
+    # Pull Requests
+    local pr_events
+    pr_events=$(jq -r --arg date "$target_date" '
+        [.[] | select(.type == "PullRequestEvent" and (.created_at | split("T")[0] == $date))]
+        | .[] | "\(.payload.action)	\(.repo.name)	\(.payload.number)	\(.payload.pull_request.head.ref // "—")"
+    ' "$cache_file" 2>/dev/null)
+
+    if [[ -n "$pr_events" ]]; then
+        while IFS=$'"'"'	'"'"' read -r action repo number branch; do
+            local short_repo="${repo#*/}"
+            case "$action" in
+                opened)  pr_output+="- Opened ${repo}#${number} \`${branch}\`\n" ;;
+                closed)  pr_output+="- Closed ${repo}#${number} \`${branch}\`\n" ;;
+                merged)  pr_output+="- Merged ${repo}#${number} \`${branch}\`\n" ;;
+                *)       pr_output+="- ${action} ${repo}#${number}\n" ;;
+            esac
+            pr_count=$((pr_count + 1))
+        done <<< "$pr_events"
+    fi
+
+    # Issues
+    local issue_events
+    issue_events=$(jq -r --arg date "$target_date" '
+        [.[] | select(.type == "IssuesEvent" and (.payload.action == "opened" or .payload.action == "closed") and (.created_at | split("T")[0] == $date))]
+        | .[] | "\(.payload.action)	\(.repo.name)	\(.payload.issue.number)	\(.payload.issue.title)"
+    ' "$cache_file" 2>/dev/null)
+
+    if [[ -n "$issue_events" ]]; then
+        while IFS=$'"'"'	'"'"' read -r action repo number title; do
+            case "$action" in
+                opened) issue_output+="- Opened ${repo}#${number} \"${title}\"\n" ;;
+                closed) issue_output+="- Closed ${repo}#${number} \"${title}\"\n" ;;
+                *)      issue_output+="- ${action} ${repo}#${number} \"${title}\"\n" ;;
+            esac
+            issue_count=$((issue_count + 1))
+        done <<< "$issue_events"
+    fi
+
+    # New repos
+    local create_events
+    create_events=$(jq -r --arg date "$target_date" '
+        [.[] | select(.type == "CreateEvent" and .payload.ref_type == "repository" and (.created_at | split("T")[0] == $date))]
+        | .[] | .repo.name
+    ' "$cache_file" 2>/dev/null)
+
+    if [[ -n "$create_events" ]]; then
+        while IFS= read -r repo; do
+            create_output+="- Created ${repo}\n"
+            create_count=$((create_count + 1))
+        done <<< "$create_events"
+    fi
+
+    # Reviews
+    local review_events
+    review_events=$(jq -r --arg date "$target_date" '
+        [.[] | select((.type == "PullRequestReviewEvent" or .type == "PullRequestReviewCommentEvent") and (.created_at | split("T")[0] == $date))]
+        | group_by(.repo.name + "#" + (.payload.pull_request.number // .payload.issue.number | tostring))
+        | .[] | "\(.[0].repo.name)	\(.[0].payload.pull_request.number // .[0].payload.issue.number)	\(length)"
+    ' "$cache_file" 2>/dev/null)
+
+    if [[ -n "$review_events" ]]; then
+        while IFS=$'"'"'	'"'"' read -r repo number count; do
+            review_output+="- Reviewed ${repo}#${number}"
+            [[ "$count" -gt 1 ]] && review_output+=" ($count comments)"
+            review_output+="\n"
+            review_count=$((review_count + 1))
+        done <<< "$review_events"
+    fi
+
+    # Only output if there is something
+    local total=$((pr_count + issue_count + create_count + review_count))
+    [[ $total -eq 0 ]] && return
+
+    echo ""
+    if [[ $pr_count -gt 0 ]]; then
+        echo "**Pull Requests**"
+        echo "$pr_output"
+    fi
+    if [[ $issue_count -gt 0 ]]; then
+        echo "**Issues**"
+        echo "$issue_output"
+    fi
+    if [[ $create_count -gt 0 ]]; then
+        echo "**New Repos**"
+        echo "$create_output"
+    fi
+    if [[ $review_count -gt 0 ]]; then
+        echo "**Reviews**"
+        echo "$review_output"
+    fi
+}
+
+_collect_git_activity() {
+    local target_date="$1"
+    local output="" commit_count=0
+    local -a repo_dirs=("${(@s/:/)REPOS_DIR}")
+
+    local repo_name log count
+
+    # Collect all git repos (up to 3 levels deep) from each search path
+    local -a all_repos=()
+    local -A seen_repos=()
+    for repos_parent in "${repo_dirs[@]}"; do
+        [[ -d "$repos_parent" ]] || continue
+        while IFS= read -r repo; do
+            repo="${repo%/.git}"
+            [[ -z "${seen_repos[$repo]:-}" ]] && all_repos+=("$repo") && seen_repos[$repo]=1
+        done < <(find "$repos_parent" -maxdepth 3 -name .git -type d 2>/dev/null)
+    done
+
+    # Also discover repos from Claude session project paths
+    if [[ -d "$CLAUDE_PROJECTS_DIR" ]]; then
+        local proj_path
+        for index_file in "$CLAUDE_PROJECTS_DIR"/*/sessions-index.json(N); do
+            while IFS= read -r proj_path; do
+                [[ -d "$proj_path/.git" ]] || continue
+                [[ -z "${seen_repos[$proj_path]:-}" ]] && all_repos+=("$proj_path") && seen_repos[$proj_path]=1
+            done < <(jq -r '.entries[].projectPath // empty' "$index_file" 2>/dev/null | sort -u)
+        done
+    fi
+
+    for repo in "${all_repos[@]}"; do
+        [[ -d "$repo/.git" ]] || continue
+        repo_name=$(basename "$repo")
+
+        log=$(git -C "$repo" log \
+            --after="${target_date}T00:00:00" \
+            --before="${target_date}T23:59:59" \
+            --pretty=format:"- %s (\`%h\`)" 2>/dev/null || true)
+
+        if [[ -n "$log" ]]; then
+            count=$(echo "$log" | wc -l | tr -d ' ')
+            commit_count=$((commit_count + count))
+            output+="**$repo_name** ($count commits)\n$log\n\n"
+        fi
+    done
+
+    if [[ -n "$output" ]]; then
+        echo "$commit_count commits across repos\n"
+        echo "$output"
+    else
+        echo "*No commits on $target_date*"
+    fi
+}
+
+_collect_shell_history() {
+    local target_date="$1"
+
+    if [[ ! -f "$HIST_FILE" ]]; then
+        echo "*No shell history file found*"
+        return
+    fi
+
+    local start_ts end_ts
+    start_ts=$(_date_epoch "$target_date 00:00:00")
+    end_ts=$(_date_epoch "$target_date 23:59:59")
+
+    local commands=()
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^:\ ([0-9]+):[0-9]+\;(.+)$ ]]; then
+            ts="${match[1]}" cmd="${match[2]}"
+            if (( ts >= start_ts && ts <= end_ts )); then
+                commands+=("$cmd")
+            fi
+        fi
+    done < "$HIST_FILE"
+
+    if (( ${#commands[@]} == 0 )); then
+        echo "*No shell commands recorded for $target_date*"
+        return
+    fi
+
+    echo "${#commands[@]} commands run\n"
+
+    local -A cmd_counts
+    local notable=()
+    for cmd in "${commands[@]}"; do
+        base="${cmd%% *}"
+        case "$base" in
+            ls|cd|pwd|clear|echo|cat|less|more) continue ;;
+        esac
+        cmd_counts[$base]=$(( ${cmd_counts[$base]:-0} + 1 ))
+        case "$base" in
+            git|docker|npm|pip|brew|cargo|make|kubectl|terraform|vault|claude)
+                notable+=("$cmd") ;;
+        esac
+    done
+
+    echo "**Most used commands:**"
+    for base count in "${(@kv)cmd_counts}"; do
+        echo "- \`$base\` ($count times)"
+    done | sort -t'(' -k2 -rn | head -10
+
+    if (( ${#notable[@]} > 0 )); then
+        echo "\n**Notable commands:**"
+        printf '%s\n' "${notable[@]}" | sort -u | head -20 | while read -r cmd; do
+            echo "- \`$cmd\`"
+        done
+    fi
+}
+
+_collect_calendar() {
+    local target_date="$1"
+
+    [[ "$GCAL_ENABLED" != "true" ]] && return
+
+    if ! command -v gcalcli &>/dev/null; then
+        echo "*Install gcalcli for calendar integration: \`pip install gcalcli\`*"
+        return
+    fi
+
+    local events
+    events=$(gcalcli agenda "$target_date" "$target_date 23:59" \
+        --nocolor --tsv 2>/dev/null || true)
+
+    if [[ -z "$events" || "$events" == *"No Events Found"* ]]; then
+        echo "*No calendar events on $target_date*"
+        return
+    fi
+
+    local count=$(echo "$events" | wc -l | tr -d ' ')
+    echo "$count events\n"
+
+    echo "$events" | while IFS=$'\t' read -r sd st ed et title rest; do
+        [[ -n "$title" ]] && echo "- **$st - $et** $title"
+    done
+}
+
+_collect_claude_sessions() {
+    local target_date="$1"
+
+    if [[ ! -d "$CLAUDE_PROJECTS_DIR" ]]; then
+        echo "*No Claude Code sessions directory found*"
+        return
+    fi
+    if ! command -v jq &>/dev/null; then
+        echo "*Install jq for Claude session parsing*"
+        return
+    fi
+
+    local session_count=0 output=""
+    local project_name sessions count time
+
+    for index_file in "$CLAUDE_PROJECTS_DIR"/*/sessions-index.json(N); do
+        [[ -f "$index_file" ]] || continue
+        project_name=$(basename "$(dirname "$index_file")")
+
+        sessions=$(jq -r --arg date "$target_date" '
+            .entries[]
+            | select(.created
+                | split("T")[0] == $date)
+            | "\(.created)\t\(.messageCount // "?")\t\(.gitBranch // "—")"
+        ' "$index_file" 2>/dev/null || true)
+
+        if [[ -n "$sessions" ]]; then
+            count=$(echo "$sessions" | wc -l | tr -d ' ')
+            session_count=$((session_count + count))
+            output+="**$project_name** ($count sessions)\n"
+
+            echo "$sessions" | while IFS=$'\t' read -r ts msgs branch; do
+                time=$(echo "$ts" | sed 's/.*T//' | cut -d. -f1 | cut -d: -f1-2)
+                output+="- $time — $msgs messages"
+                [[ "$branch" != "—" ]] && output+=" (branch: \`$branch\`)"
+                output+="\n"
+            done
+            output+="\n"
+        fi
+    done
+
+    if [[ -n "$output" ]]; then
+        echo "$session_count sessions\n"
+        echo "$output"
+    else
+        echo "*No Claude Code sessions on $target_date*"
+    fi
+}
+
+# --- Recap & Weekly subcommands ---
+
+cmd_recap() {
+    local target="${1:-today}"
+
+    case "$target" in
+        today)     local target_date=$(vault_date) ;;
+        yesterday) local target_date=$(_date_yesterday) ;;
+        *)         local target_date="$target" ;;
+    esac
+
+    local dow=$(_date_fmt "$target_date" "+%A")
+    local month=$(echo "$target_date" | cut -d- -f2)
+    local day=$(echo "$target_date" | cut -d- -f3)
+    local recap_file="$VAULT_DIR/journal/$target_date.md"
+
+    # Pull latest vault state
+    if [[ -d "$VAULT_DIR/.git" ]]; then
+        (cd "$VAULT_DIR" && git pull --rebase --quiet) 2>/dev/null || true
+    fi
+
+    mkdir -p "$VAULT_DIR/journal"
+
+    # Append if file already has content, otherwise create fresh
+    local append_mode=false
+    if [[ -f "$recap_file" ]]; then
+        local existing_size=$(wc -c < "$recap_file" | tr -d ' ')
+        (( existing_size > 200 )) && append_mode=true
+    fi
+
+    {
+        if $append_mode; then
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Auto-Recap ($(vault_hostname))"
+            echo "_Generated at $(vault_time)_"
+        else
+            echo "---"
+            echo "created: $target_date"
+            echo "type: daily-recap"
+            echo "tags: [recap, journal]"
+            echo "---"
+            echo ""
+            echo "# $dow, $month/$day"
+        fi
+
+        echo ""
+        echo "## Git & GitHub"
+        _collect_git_activity "$target_date"
+        _collect_github_activity "$target_date"
+
+        echo ""
+        echo "## Claude Code Sessions"
+        _collect_claude_sessions "$target_date"
+
+        echo ""
+        echo "## Shell Activity"
+        _collect_shell_history "$target_date"
+
+        echo ""
+        echo "## Calendar"
+        _collect_calendar "$target_date"
+
+        echo ""
+        echo "## Inbox Captures"
+        local inbox_file="$VAULT_DIR/00-inbox/$target_date.md"
+        if [[ -f "$inbox_file" ]]; then
+            cat "$inbox_file"
+        else
+            echo "*No captures today*"
+        fi
+
+    } >> "$recap_file" 2>/dev/null
+
+    # Also harvest Claude sessions as resource notes
+    cmd_harvest 2>/dev/null || true
+
+    # Commit and push
+    if [[ -d "$VAULT_DIR/.git" ]]; then
+        (cd "$VAULT_DIR" && git add -A && \
+            git commit -m "recap: $target_date [$(vault_hostname)]" --quiet && \
+            git push --quiet) 2>/dev/null || true
+    fi
+
+    echo "Recap written to $recap_file"
+}
+
+cmd_weekly() {
+    local end_date="${1:-$(vault_date)}"
+    local start_date=$(_date_offset "$end_date" -6)
+    local week_num=$(_date_fmt "$end_date" +%V)
+    local year=$(echo "$end_date" | cut -d- -f1)
+    local weekly_file="$VAULT_DIR/journal/week-${year}-${week_num}.md"
+
+    # Pull latest
+    if [[ -d "$VAULT_DIR/.git" ]]; then
+        (cd "$VAULT_DIR" && git pull --rebase --quiet) 2>/dev/null || true
+    fi
+
+    mkdir -p "$VAULT_DIR/journal"
+
+    # Collect daily files
+    local daily_files=()
+    local current="$start_date"
+    local daily
+    while [[ "$current" < "$end_date" || "$current" == "$end_date" ]]; do
+        daily="$VAULT_DIR/journal/$current.md"
+        [[ -f "$daily" ]] && daily_files+=("$daily")
+        current=$(_date_offset "$current" +1)
+    done
+
+    if (( ${#daily_files[@]} == 0 )); then
+        echo "No daily recaps found for week $week_num ($start_date to $end_date)"
+        return 0
+    fi
+
+    # Extract stats
+    local total_commits=0 total_sessions=0
+    local repo count proj dow
+    local active_days=${#daily_files[@]}
+    declare -A repo_commits project_sessions
+
+    for file in "${daily_files[@]}"; do
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^\*\*(.+)\*\*\ \(([0-9]+)\ commits\) ]]; then
+                repo="${match[1]}" count="${match[2]}"
+                repo_commits[$repo]=$(( ${repo_commits[$repo]:-0} + count ))
+                total_commits=$((total_commits + count))
+            fi
+        done < "$file"
+
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^\*\*(.+)\*\*\ \(([0-9]+)\ sessions?\) ]]; then
+                proj="${match[1]}" count="${match[2]}"
+                project_sessions[$proj]=$(( ${project_sessions[$proj]:-0} + count ))
+                total_sessions=$((total_sessions + count))
+            fi
+        done < "$file"
+    done
+
+    # Write rollup
+    {
+        echo "---"
+        echo "created: $(vault_date)"
+        echo "type: weekly-rollup"
+        echo "tags: [weekly, journal, review]"
+        echo "week: $week_num"
+        echo "---"
+        echo ""
+        echo "# Week $week_num — $start_date to $end_date"
+        echo ""
+        echo "## At a Glance"
+        echo ""
+        echo "| Metric | Count |"
+        echo "|--------|-------|"
+        echo "| Active days | $active_days / 7 |"
+        echo "| Total commits | $total_commits |"
+        echo "| Claude sessions | $total_sessions |"
+        echo ""
+
+        if (( ${#repo_commits[@]} > 0 )); then
+            echo "## Repos"
+            echo ""
+            for repo count in "${(@kv)repo_commits}"; do
+                echo "- **$repo** — $count commits"
+            done | sort -t'—' -k2 -rn
+            echo ""
+        fi
+
+        if (( ${#project_sessions[@]} > 0 )); then
+            echo "## Claude Code Projects"
+            echo ""
+            for proj count in "${(@kv)project_sessions}"; do
+                echo "- **$proj** — $count sessions"
+            done | sort -t'—' -k2 -rn
+            echo ""
+        fi
+
+        echo "## Daily Notes"
+        echo ""
+        current="$start_date"
+        while [[ "$current" < "$end_date" || "$current" == "$end_date" ]]; do
+            dow=$(_date_fmt "$current" "+%A")
+            if [[ -f "$VAULT_DIR/journal/$current.md" ]]; then
+                echo "- [[$current|$dow]]"
+            else
+                echo "- $dow — *no recap*"
+            fi
+            current=$(_date_offset "$current" +1)
+        done
+        echo ""
+
+        echo "## Reflection"
+        echo ""
+        echo "> What went well this week?"
+        echo ""
+        echo ""
+        echo "> What could be better?"
+        echo ""
+        echo ""
+        echo "> Focus for next week?"
+        echo ""
+
+    } > "$weekly_file"
+
+    # Commit and push
+    if [[ -d "$VAULT_DIR/.git" ]]; then
+        (cd "$VAULT_DIR" && git add -A && \
+            git commit -m "weekly: week $week_num [$(vault_hostname)]" --quiet && \
+            git push --quiet) 2>/dev/null || true
+    fi
+
+    echo "Weekly rollup written to $weekly_file"
+}
+
+cmd_backfill() {
+    local -A dates=()
+
+    # Collect dates from Claude sessions
+    for index_file in "$CLAUDE_PROJECTS_DIR"/*/sessions-index.json(N); do
+        [[ -f "$index_file" ]] || continue
+        while IFS= read -r d; do
+            [[ -n "$d" ]] && dates[$d]=1
+        done < <(jq -r '.entries[] | .created | split("T")[0]' "$index_file" 2>/dev/null)
+    done
+
+    # Collect dates from git repos
+    local -a repo_dirs=("${(@s/:/)REPOS_DIR}")
+    local git_email=$(git config user.email 2>/dev/null)
+    for dir in "${repo_dirs[@]}"; do
+        [[ -d "$dir" ]] || continue
+        for repo in "$dir"/*/; do
+            [[ -d "$repo/.git" ]] || continue
+            while IFS= read -r d; do
+                [[ -n "$d" ]] && dates[$d]=1
+            done < <(git -C "$repo" log --author="$git_email" --format="%ad" --date=short 2>/dev/null)
+        done
+    done
+
+    local today=$(vault_date)
+    local sorted_dates=($(echo "${(k)dates[@]}" | tr ' ' '\n' | sort))
+
+    if [[ ${#sorted_dates[@]} -eq 0 ]]; then
+        echo "No dates with activity found"
+        return 0
+    fi
+
+    echo "Found ${#sorted_dates[@]} dates with activity (${sorted_dates[1]} to ${sorted_dates[-1]})"
+
+    # Pull once
+    if [[ -d "$VAULT_DIR/.git" ]]; then
+        (cd "$VAULT_DIR" && git pull --rebase --quiet) 2>/dev/null || true
+    fi
+    mkdir -p "$VAULT_DIR/journal"
+
+    local count=0
+    local dow month day recap_file inbox_file
+    for target_date in "${sorted_dates[@]}"; do
+        [[ "$target_date" > "$today" ]] && continue
+
+        dow=$(_date_fmt "$target_date" "+%A")
+        month=$(echo "$target_date" | cut -d- -f2)
+        day=$(echo "$target_date" | cut -d- -f3)
+        recap_file="$VAULT_DIR/journal/$target_date.md"
+
+        {
+            echo "---"
+            echo "created: $target_date"
+            echo "type: daily-recap"
+            echo "tags: [recap, journal]"
+            echo "---"
+            echo ""
+            echo "# $dow, $month/$day"
+
+            echo ""
+            echo "## Git Activity"
+            _collect_git_activity "$target_date"
+
+            echo ""
+            echo "## Claude Code Sessions"
+            _collect_claude_sessions "$target_date"
+
+            echo ""
+            echo "## Shell Activity"
+            _collect_shell_history "$target_date"
+
+            echo ""
+            echo "## Calendar"
+            _collect_calendar "$target_date"
+
+            echo ""
+            echo "## Inbox Captures"
+            inbox_file="$VAULT_DIR/00-inbox/$target_date.md"
+            if [[ -f "$inbox_file" ]]; then
+                cat "$inbox_file"
+            else
+                echo "*No captures*"
+            fi
+        } > "$recap_file" 2>/dev/null
+
+        count=$((count + 1))
+        echo "  [$count] $target_date"
+    done
+
+    # Harvest once
+    cmd_harvest 2>/dev/null || true
+
+    # Commit and push once
+    if [[ -d "$VAULT_DIR/.git" ]]; then
+        (cd "$VAULT_DIR" && git add -A && \
+            git commit -m "backfill: $count recaps [$(vault_hostname)]" --quiet && \
+            git push --quiet) 2>/dev/null || true
+    fi
+
+    echo "Backfilled $count recaps"
+}
+
 # --- Dispatch ---
 case "${1:-help}" in
     add)      shift; cmd_add "$@" ;;
@@ -564,6 +1236,9 @@ case "${1:-help}" in
     sync)     shift; cmd_sync "$@" ;;
     harvest)  shift; cmd_harvest "$@" ;;
     recent|log) shift; cmd_recent "$@" ;;
+    recap)    shift; cmd_recap "$@" ;;
+    backfill) shift; cmd_backfill "$@" ;;
+    weekly)   shift; cmd_weekly "$@" ;;
     help|-h|--help) cmd_help ;;
     *) echo "Unknown command: $1. Run 'vault help' for usage." >&2; exit 1 ;;
 esac
