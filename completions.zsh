@@ -11,6 +11,8 @@ _vault() {
         'sync:Git commit + pull + push'
         'harvest:Import Claude Code sessions'
         'recent:Show recently modified notes'
+        'recap:Auto-generate daily recap from activity'
+        'weekly:Weekly rollup from daily recaps'
         'help:Show help'
     )
 

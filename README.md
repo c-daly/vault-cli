@@ -22,6 +22,8 @@ Obsidian is great for linking and visualizing notes, but opening a GUI app to jo
 | `vault recent [N]` | Show N most recently modified notes (default: 10) |
 | `vault harvest` | Import Claude Code session metadata as vault notes |
 | `vault sync` | Git add, commit, pull --rebase, push |
+| `vault recap [today\|yesterday\|DATE]` | Auto-generate daily recap from activity |
+| `vault weekly [end-date]` | Weekly rollup from daily recaps |
 | `vault help` | Show usage |
 
 ## Install
@@ -52,6 +54,7 @@ VAULT_DIR="/path/to/your/obsidian/vault"
 - **fzf** — for fuzzy selection in search
 - **nvim** (or any `$EDITOR`) — for editing notes
 - **jq** — for harvest (Claude Code session parsing)
+- **gcalcli** (optional) — for Google Calendar in recaps (`pip install gcalcli`)
 
 All common tools, likely already installed. On Ubuntu/Debian:
 
@@ -124,18 +127,6 @@ vault/
 
 Templates use Obsidian's `{{date}}` and `{{title}}` syntax. If a template doesn't exist, a sensible default is used.
 
-## Configuration
-
-Config file: `~/.config/vault-cli/config`
-
-```bash
-# Required: path to your Obsidian vault
-VAULT_DIR="/path/to/vault"
-
-# Optional: override editor (defaults to $EDITOR, then nvim)
-VAULT_EDITOR="nvim"
-```
-
 ## Multi-machine setup
 
 Since `vault-cli` works with a git-backed vault:
@@ -146,6 +137,56 @@ Since `vault-cli` works with a git-backed vault:
 4. Use `vault sync` to keep everything in sync
 
 Harvested Claude Code sessions are tagged with the machine's hostname so you know which machine each session came from.
+
+### Automated daily recaps
+
+```bash
+vault recap              # generate today's recap
+vault recap yesterday    # backfill yesterday
+vault recap 2026-02-20   # specific date
+```
+
+Collects git commits (across all repos in `VAULT_REPOS_DIR`), Claude Code sessions, shell history highlights, Google Calendar events, and `vault add` captures into a daily note at `journal/YYYY-MM-DD.md`. Pulls the vault before writing and pushes after, so all machines contribute.
+
+If a daily note already exists (e.g., from `vault daily` or another machine), the recap appends under a separator rather than overwriting.
+
+### Weekly rollups
+
+```bash
+vault weekly             # this week
+vault weekly 2026-02-23  # week ending on a specific date
+```
+
+Reads the past 7 days of daily recaps and produces `journal/week-YYYY-WW.md` with stats, per-repo/project breakdowns, links to daily notes, and reflection prompts.
+
+### Scheduling
+
+Run `setup-automation.sh` on each machine to schedule recaps automatically:
+
+```bash
+./setup-automation.sh              # install (cron on Linux/WSL, launchd on macOS)
+./setup-automation.sh --uninstall  # remove
+```
+
+Default: daily recap at 11 PM, weekly rollup at 11:30 PM Sundays. Logs to `~/.local/log/`.
+
+## Configuration
+
+Config file: `~/.config/vault-cli/config`
+
+```bash
+# Required: path to your Obsidian vault
+VAULT_DIR="/path/to/vault"
+
+# Optional: override editor (defaults to $EDITOR, then nvim)
+VAULT_EDITOR="nvim"
+
+# Recap: where to scan for git repos (colon-separated for multiple dirs)
+VAULT_REPOS_DIR="$HOME/projects"
+
+# Recap: enable Google Calendar (requires gcalcli)
+VAULT_GCAL_ENABLED="true"
+```
 
 ## License
 
