@@ -61,6 +61,7 @@ Commands:
   harvest [--all] [--project <name>]  Import Claude Code sessions
   recent [N]             Show recently modified notes (default: 10)
   recap [today|yesterday|DATE]  Auto-generate daily recap from activity
+  backfill                Generate recaps for all past dates with activity
   weekly [end-date]      Weekly rollup from daily recaps
   help                   Show this help
 HELP
@@ -960,6 +961,107 @@ cmd_weekly() {
     echo "Weekly rollup written to $weekly_file"
 }
 
+cmd_backfill() {
+    local -A dates=()
+
+    # Collect dates from Claude sessions
+    for index_file in "$CLAUDE_PROJECTS_DIR"/*/sessions-index.json(N); do
+        [[ -f "$index_file" ]] || continue
+        while IFS= read -r d; do
+            [[ -n "$d" ]] && dates[$d]=1
+        done < <(jq -r '.entries[] | .created | split("T")[0]' "$index_file" 2>/dev/null)
+    done
+
+    # Collect dates from git repos
+    local -a repo_dirs=("${(@s/:/)REPOS_DIR}")
+    local git_email=$(git config user.email 2>/dev/null)
+    for dir in "${repo_dirs[@]}"; do
+        [[ -d "$dir" ]] || continue
+        for repo in "$dir"/*/; do
+            [[ -d "$repo/.git" ]] || continue
+            while IFS= read -r d; do
+                [[ -n "$d" ]] && dates[$d]=1
+            done < <(git -C "$repo" log --author="$git_email" --format="%ad" --date=short 2>/dev/null)
+        done
+    done
+
+    local today=$(vault_date)
+    local sorted_dates=($(echo "${(k)dates[@]}" | tr ' ' '\n' | sort))
+
+    if [[ ${#sorted_dates[@]} -eq 0 ]]; then
+        echo "No dates with activity found"
+        return 0
+    fi
+
+    echo "Found ${#sorted_dates[@]} dates with activity (${sorted_dates[1]} to ${sorted_dates[-1]})"
+
+    # Pull once
+    if [[ -d "$VAULT_DIR/.git" ]]; then
+        (cd "$VAULT_DIR" && git pull --rebase --quiet) 2>/dev/null || true
+    fi
+    mkdir -p "$VAULT_DIR/journal"
+
+    local count=0
+    for target_date in "${sorted_dates[@]}"; do
+        [[ "$target_date" > "$today" ]] && continue
+
+        local dow=$(_date_fmt "$target_date" "+%A")
+        local month=$(echo "$target_date" | cut -d- -f2)
+        local day=$(echo "$target_date" | cut -d- -f3)
+        local recap_file="$VAULT_DIR/journal/$target_date.md"
+
+        {
+            echo "---"
+            echo "created: $target_date"
+            echo "type: daily-recap"
+            echo "tags: [recap, journal]"
+            echo "---"
+            echo ""
+            echo "# $dow, $month/$day"
+
+            echo ""
+            echo "## Git Activity"
+            _collect_git_activity "$target_date"
+
+            echo ""
+            echo "## Claude Code Sessions"
+            _collect_claude_sessions "$target_date"
+
+            echo ""
+            echo "## Shell Activity"
+            _collect_shell_history "$target_date"
+
+            echo ""
+            echo "## Calendar"
+            _collect_calendar "$target_date"
+
+            echo ""
+            echo "## Inbox Captures"
+            local inbox_file="$VAULT_DIR/00-inbox/$target_date.md"
+            if [[ -f "$inbox_file" ]]; then
+                cat "$inbox_file"
+            else
+                echo "*No captures*"
+            fi
+        } > "$recap_file" 2>/dev/null
+
+        count=$((count + 1))
+        echo "  [$count] $target_date"
+    done
+
+    # Harvest once
+    cmd_harvest 2>/dev/null || true
+
+    # Commit and push once
+    if [[ -d "$VAULT_DIR/.git" ]]; then
+        (cd "$VAULT_DIR" && git add -A && \
+            git commit -m "backfill: $count recaps [$(vault_hostname)]" --quiet && \
+            git push --quiet) 2>/dev/null || true
+    fi
+
+    echo "Backfilled $count recaps"
+}
+
 # --- Dispatch ---
 case "${1:-help}" in
     add)      shift; cmd_add "$@" ;;
@@ -971,6 +1073,7 @@ case "${1:-help}" in
     harvest)  shift; cmd_harvest "$@" ;;
     recent|log) shift; cmd_recent "$@" ;;
     recap)    shift; cmd_recap "$@" ;;
+    backfill) shift; cmd_backfill "$@" ;;
     weekly)   shift; cmd_weekly "$@" ;;
     help|-h|--help) cmd_help ;;
     *) echo "Unknown command: $1. Run 'vault help' for usage." >&2; exit 1 ;;
