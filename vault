@@ -581,6 +581,148 @@ cmd_harvest() {
 
 # --- Recap collectors ---
 
+_fetch_github_events_cache() {
+    local cache_file="/tmp/vault-github-events-$$.json"
+
+    # Return cache if already fetched this session
+    if [[ -f "$cache_file" ]]; then
+        echo "$cache_file"
+        return
+    fi
+
+    if ! command -v gh &>/dev/null; then
+        echo ""
+        return
+    fi
+    if ! gh auth status &>/dev/null 2>&1; then
+        echo ""
+        return
+    fi
+
+    local gh_user
+    gh_user=$(gh api user --jq .login 2>/dev/null) || { echo ""; return; }
+
+    # Fetch up to 10 pages of events
+    local page=1 count tmp_page="/tmp/vault-gh-page-$$.json"
+    echo "[]" > "$cache_file"
+    while [[ $page -le 10 ]]; do
+        gh api "/users/$gh_user/events?per_page=100&page=$page" > "$tmp_page" 2>/dev/null || break
+
+        count=$(jq 'length' "$tmp_page" 2>/dev/null) || break
+        [[ "$count" -eq 0 ]] && break
+
+        # Merge into cache
+        jq -s '.[0] + .[1]' "$cache_file" "$tmp_page" > "${cache_file}.tmp" && mv "${cache_file}.tmp" "$cache_file"
+
+        page=$((page + 1))
+    done
+    rm -f "$tmp_page"
+
+    echo "$cache_file"
+}
+
+_collect_github_activity() {
+    local target_date="$1"
+
+    local cache_file
+    cache_file=$(_fetch_github_events_cache)
+    [[ -z "$cache_file" || ! -f "$cache_file" ]] && return
+
+    local pr_output="" issue_output="" create_output="" review_output=""
+    local pr_count=0 issue_count=0 create_count=0 review_count=0
+
+    # Pull Requests
+    local pr_events
+    pr_events=$(jq -r --arg date "$target_date" '
+        [.[] | select(.type == "PullRequestEvent" and (.created_at | split("T")[0] == $date))]
+        | .[] | "\(.payload.action)	\(.repo.name)	\(.payload.number)	\(.payload.pull_request.head.ref // "—")"
+    ' "$cache_file" 2>/dev/null)
+
+    if [[ -n "$pr_events" ]]; then
+        while IFS=$'"'"'	'"'"' read -r action repo number branch; do
+            local short_repo="${repo#*/}"
+            case "$action" in
+                opened)  pr_output+="- Opened ${repo}#${number} \`${branch}\`\n" ;;
+                closed)  pr_output+="- Closed ${repo}#${number} \`${branch}\`\n" ;;
+                merged)  pr_output+="- Merged ${repo}#${number} \`${branch}\`\n" ;;
+                *)       pr_output+="- ${action} ${repo}#${number}\n" ;;
+            esac
+            pr_count=$((pr_count + 1))
+        done <<< "$pr_events"
+    fi
+
+    # Issues
+    local issue_events
+    issue_events=$(jq -r --arg date "$target_date" '
+        [.[] | select(.type == "IssuesEvent" and (.payload.action == "opened" or .payload.action == "closed") and (.created_at | split("T")[0] == $date))]
+        | .[] | "\(.payload.action)	\(.repo.name)	\(.payload.issue.number)	\(.payload.issue.title)"
+    ' "$cache_file" 2>/dev/null)
+
+    if [[ -n "$issue_events" ]]; then
+        while IFS=$'"'"'	'"'"' read -r action repo number title; do
+            case "$action" in
+                opened) issue_output+="- Opened ${repo}#${number} \"${title}\"\n" ;;
+                closed) issue_output+="- Closed ${repo}#${number} \"${title}\"\n" ;;
+                *)      issue_output+="- ${action} ${repo}#${number} \"${title}\"\n" ;;
+            esac
+            issue_count=$((issue_count + 1))
+        done <<< "$issue_events"
+    fi
+
+    # New repos
+    local create_events
+    create_events=$(jq -r --arg date "$target_date" '
+        [.[] | select(.type == "CreateEvent" and .payload.ref_type == "repository" and (.created_at | split("T")[0] == $date))]
+        | .[] | .repo.name
+    ' "$cache_file" 2>/dev/null)
+
+    if [[ -n "$create_events" ]]; then
+        while IFS= read -r repo; do
+            create_output+="- Created ${repo}\n"
+            create_count=$((create_count + 1))
+        done <<< "$create_events"
+    fi
+
+    # Reviews
+    local review_events
+    review_events=$(jq -r --arg date "$target_date" '
+        [.[] | select((.type == "PullRequestReviewEvent" or .type == "PullRequestReviewCommentEvent") and (.created_at | split("T")[0] == $date))]
+        | group_by(.repo.name + "#" + (.payload.pull_request.number // .payload.issue.number | tostring))
+        | .[] | "\(.[0].repo.name)	\(.[0].payload.pull_request.number // .[0].payload.issue.number)	\(length)"
+    ' "$cache_file" 2>/dev/null)
+
+    if [[ -n "$review_events" ]]; then
+        while IFS=$'"'"'	'"'"' read -r repo number count; do
+            review_output+="- Reviewed ${repo}#${number}"
+            [[ "$count" -gt 1 ]] && review_output+=" ($count comments)"
+            review_output+="\n"
+            review_count=$((review_count + 1))
+        done <<< "$review_events"
+    fi
+
+    # Only output if there is something
+    local total=$((pr_count + issue_count + create_count + review_count))
+    [[ $total -eq 0 ]] && return
+
+    echo ""
+    if [[ $pr_count -gt 0 ]]; then
+        echo "**Pull Requests**"
+        echo "$pr_output"
+    fi
+    if [[ $issue_count -gt 0 ]]; then
+        echo "**Issues**"
+        echo "$issue_output"
+    fi
+    if [[ $create_count -gt 0 ]]; then
+        echo "**New Repos**"
+        echo "$create_output"
+    fi
+    if [[ $review_count -gt 0 ]]; then
+        echo "**Reviews**"
+        echo "$review_output"
+    fi
+}
+
 _collect_git_activity() {
     local target_date="$1"
     local output="" commit_count=0
@@ -814,8 +956,9 @@ cmd_recap() {
         fi
 
         echo ""
-        echo "## Git Activity"
+        echo "## Git & GitHub"
         _collect_git_activity "$target_date"
+        _collect_github_activity "$target_date"
 
         echo ""
         echo "## Claude Code Sessions"
