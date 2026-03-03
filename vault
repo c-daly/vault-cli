@@ -590,12 +590,25 @@ _collect_git_activity() {
 
     # Collect all git repos (up to 3 levels deep) from each search path
     local -a all_repos=()
+    local -A seen_repos=()
     for repos_parent in "${repo_dirs[@]}"; do
         [[ -d "$repos_parent" ]] || continue
         while IFS= read -r repo; do
-            all_repos+=("${repo%/.git}")
+            repo="${repo%/.git}"
+            [[ -z "${seen_repos[$repo]:-}" ]] && all_repos+=("$repo") && seen_repos[$repo]=1
         done < <(find "$repos_parent" -maxdepth 3 -name .git -type d 2>/dev/null)
     done
+
+    # Also discover repos from Claude session project paths
+    if [[ -d "$CLAUDE_PROJECTS_DIR" ]]; then
+        local proj_path
+        for index_file in "$CLAUDE_PROJECTS_DIR"/*/sessions-index.json(N); do
+            while IFS= read -r proj_path; do
+                [[ -d "$proj_path/.git" ]] || continue
+                [[ -z "${seen_repos[$proj_path]:-}" ]] && all_repos+=("$proj_path") && seen_repos[$proj_path]=1
+            done < <(jq -r '.entries[].projectPath // empty' "$index_file" 2>/dev/null | sort -u)
+        done
+    fi
 
     for repo in "${all_repos[@]}"; do
         [[ -d "$repo/.git" ]] || continue
