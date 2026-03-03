@@ -718,10 +718,10 @@ _collect_claude_sessions() {
 
         local sessions
         sessions=$(jq -r --arg date "$target_date" '
-            to_entries[]
-            | select(.value.sessionStartTimestamp
+            .entries[]
+            | select(.created
                 | split("T")[0] == $date)
-            | "\(.value.sessionStartTimestamp)\t\(.value.numMessages // "?")\t\(.value.gitBranch // "—")"
+            | "\(.created)\t\(.messageCount // "?")\t\(.gitBranch // "—")"
         ' "$index_file" 2>/dev/null || true)
 
         if [[ -n "$sessions" ]]; then
