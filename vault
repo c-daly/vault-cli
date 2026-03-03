@@ -466,12 +466,15 @@ cmd_harvest() {
         done < "$state_file"
     fi
 
+    local session_id summary first_prompt created modified
+    local git_branch project_path message_count full_path
+    local project_dir project_name
     # Process each project's session index
     for index_file in "$claude_dir"/*/sessions-index.json; do
         [[ -f "$index_file" ]] || continue
 
-        local project_dir="$(dirname "$index_file")"
-        local project_name="$(basename "$project_dir")"
+        project_dir="$(dirname "$index_file")"
+        project_name="$(basename "$project_dir")"
 
         # Apply project filter
         if [[ -n "$project_filter" ]] && [[ "$project_name" != *"$project_filter"* ]]; then
@@ -480,8 +483,6 @@ cmd_harvest() {
 
         # Extract all sessions as JSON lines for efficient processing
         while IFS= read -r entry; do
-            local session_id summary first_prompt created modified
-            local git_branch project_path message_count full_path
 
             session_id=$(echo "$entry" | jq -r '.sessionId // empty' 2>/dev/null) || continue
             [[ -z "$session_id" ]] && continue
