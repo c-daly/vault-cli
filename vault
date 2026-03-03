@@ -586,28 +586,31 @@ _collect_git_activity() {
     local output="" commit_count=0
     local -a repo_dirs=("${(@s/:/)REPOS_DIR}")
 
-    local git_email
-    git_email=$(git config --global user.email 2>/dev/null || echo "")
+    local repo_name log count
 
+    # Collect all git repos (up to 3 levels deep) from each search path
+    local -a all_repos=()
     for repos_parent in "${repo_dirs[@]}"; do
         [[ -d "$repos_parent" ]] || continue
-        for repo in "$repos_parent"/*(N/); do
-            [[ -d "$repo/.git" ]] || continue
-            local repo_name=$(basename "$repo")
-            local author_flag=""
-            [[ -n "$git_email" ]] && author_flag="--author=$git_email"
+        while IFS= read -r repo; do
+            all_repos+=("${repo%/.git}")
+        done < <(find "$repos_parent" -maxdepth 3 -name .git -type d 2>/dev/null)
+    done
 
-            log=$(git -C "$repo" log $author_flag \
-                --after="${target_date}T00:00:00" \
-                --before="${target_date}T23:59:59" \
-                --pretty=format:"- %s (\`%h\`)" 2>/dev/null || true)
+    for repo in "${all_repos[@]}"; do
+        [[ -d "$repo/.git" ]] || continue
+        repo_name=$(basename "$repo")
 
-            if [[ -n "$log" ]]; then
-                count=$(echo "$log" | wc -l | tr -d ' ')
-                commit_count=$((commit_count + count))
-                output+="**$repo_name** ($count commits)\n$log\n\n"
-            fi
-        done
+        log=$(git -C "$repo" log \
+            --after="${target_date}T00:00:00" \
+            --before="${target_date}T23:59:59" \
+            --pretty=format:"- %s (\`%h\`)" 2>/dev/null || true)
+
+        if [[ -n "$log" ]]; then
+            count=$(echo "$log" | wc -l | tr -d ' ')
+            commit_count=$((commit_count + count))
+            output+="**$repo_name** ($count commits)\n$log\n\n"
+        fi
     done
 
     if [[ -n "$output" ]]; then
