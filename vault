@@ -872,36 +872,50 @@ _collect_claude_sessions() {
     fi
 
     local session_count=0 output=""
-    local project_name sessions count time
+    local project_name msg_count branch time_str
+    local proj_sessions proj_output first_line ts
 
-    for index_file in "$CLAUDE_PROJECTS_DIR"/*/sessions-index.json(N); do
-        [[ -f "$index_file" ]] || continue
-        project_name=$(basename "$(dirname "$index_file")")
+    for project_dir in "$CLAUDE_PROJECTS_DIR"/*(N/); do
+        [[ -d "$project_dir" ]] || continue
+        project_name=$(basename "$project_dir")
+        proj_sessions=0 proj_output=""
 
-        sessions=$(jq -r --arg date "$target_date" '
-            .entries[]
-            | select(.created
-                | split("T")[0] == $date)
-            | "\(.created)\t\(.messageCount // "?")\t\(.gitBranch // "—")"
-        ' "$index_file" 2>/dev/null || true)
+        for session_file in "$project_dir"/*.jsonl(N); do
+            [[ -f "$session_file" ]] || continue
 
-        if [[ -n "$sessions" ]]; then
-            count=$(echo "$sessions" | wc -l | tr -d ' ')
-            session_count=$((session_count + count))
-            output+="**$project_name** ($count sessions)\n"
+            # Check first line for timestamp and metadata
+            first_line=$(head -1 "$session_file" 2>/dev/null) || true
+            [[ -n "$first_line" ]] || continue
 
-            echo "$sessions" | while IFS=$'\t' read -r ts msgs branch; do
-                time=$(echo "$ts" | sed 's/.*T//' | cut -d. -f1 | cut -d: -f1-2)
-                output+="- $time — $msgs messages"
-                [[ "$branch" != "—" ]] && output+=" (branch: \`$branch\`)"
-                output+="\n"
-            done
-            output+="\n"
+            ts=$(echo "$first_line" | jq -r '.timestamp // empty' 2>/dev/null) || true
+            [[ -n "$ts" ]] || continue
+
+            # Match date
+            [[ "${ts%%T*}" == "$target_date" ]] || continue
+
+            branch=$(echo "$first_line" | jq -r '.gitBranch // "—"' 2>/dev/null) || true
+            msg_count=$(jq -r 'select(.type == "user")' "$session_file" 2>/dev/null | wc -l | tr -d ' ' || echo 0)
+            time_str=$(echo "$ts" | sed 's/.*T//' | cut -d. -f1 | cut -d: -f1-2)
+
+            proj_sessions=$((proj_sessions + 1))
+            proj_output+="- $time_str — $msg_count messages"
+            [[ "$branch" != "—" ]] && proj_output+=" (branch: \`$branch\`)"
+            proj_output+=$'
+'
+        done
+
+        if (( proj_sessions > 0 )); then
+            session_count=$((session_count + proj_sessions))
+            output+="**$project_name** ($proj_sessions sessions)"$'
+'
+            output+="$proj_output"$'
+'
         fi
     done
 
     if [[ -n "$output" ]]; then
-        echo "$session_count sessions\n"
+        echo "$session_count sessions"
+        echo ""
         echo "$output"
     else
         echo "*No Claude Code sessions on $target_date*"
@@ -1127,25 +1141,32 @@ cmd_weekly() {
 cmd_backfill() {
     local -A dates=()
 
-    # Collect dates from Claude sessions
-    for index_file in "$CLAUDE_PROJECTS_DIR"/*/sessions-index.json(N); do
-        [[ -f "$index_file" ]] || continue
-        while IFS= read -r d; do
-            [[ -n "$d" ]] && dates[$d]=1
-        done < <(jq -r '.entries[] | .created | split("T")[0]' "$index_file" 2>/dev/null)
+    # Collect dates from Claude sessions (.jsonl files)
+    local ts
+    for project_dir in "$CLAUDE_PROJECTS_DIR"/*(N/); do
+        for session_file in "$project_dir"/*.jsonl(N); do
+            [[ -f "$session_file" ]] || continue
+            ts=$(head -1 "$session_file" | jq -r '.timestamp // empty' 2>/dev/null) || true
+            [[ -n "$ts" ]] && dates[${ts%%T*}]=1
+        done
     done
 
-    # Collect dates from git repos
+    # Collect dates from git repos (up to 3 levels deep, matching _collect_git_activity)
     local -a repo_dirs=("${(@s/:/)REPOS_DIR}")
-    local git_email=$(git config user.email 2>/dev/null)
+    local -a all_repos=()
+    local -A seen_repos=()
     for dir in "${repo_dirs[@]}"; do
         [[ -d "$dir" ]] || continue
-        for repo in "$dir"/*/; do
-            [[ -d "$repo/.git" ]] || continue
-            while IFS= read -r d; do
-                [[ -n "$d" ]] && dates[$d]=1
-            done < <(git -C "$repo" log --author="$git_email" --format="%ad" --date=short 2>/dev/null)
-        done
+        while IFS= read -r repo; do
+            repo="${repo%/.git}"
+            [[ -z "${seen_repos[$repo]:-}" ]] && all_repos+=("$repo") && seen_repos[$repo]=1
+        done < <(find "$dir" -maxdepth 3 -name .git -type d 2>/dev/null)
+    done
+    for repo in "${all_repos[@]}"; do
+        [[ -d "$repo/.git" ]] || continue
+        while IFS= read -r d; do
+            [[ -n "$d" ]] && dates[$d]=1
+        done < <(git -C "$repo" log --format="%ad" --date=short 2>/dev/null)
     done
 
     local today=$(vault_date)
@@ -1174,18 +1195,33 @@ cmd_backfill() {
         day=$(echo "$target_date" | cut -d- -f3)
         recap_file="$VAULT_DIR/journal/$target_date.md"
 
+        # Append if file already has content, otherwise create fresh
+        local append_mode=false
+        if [[ -f "$recap_file" ]]; then
+            local existing_size=$(wc -c < "$recap_file" | tr -d ' ')
+            (( existing_size > 200 )) && append_mode=true
+        fi
+
         {
-            echo "---"
-            echo "created: $target_date"
-            echo "type: daily-recap"
-            echo "tags: [recap, journal]"
-            echo "---"
-            echo ""
-            echo "# $dow, $month/$day"
+            if $append_mode; then
+                echo ""
+                echo "---"
+                echo ""
+                echo "## Auto-Recap ($(vault_hostname))"
+            else
+                echo "---"
+                echo "created: $target_date"
+                echo "type: daily-recap"
+                echo "tags: [recap, journal]"
+                echo "---"
+                echo ""
+                echo "# $dow, $month/$day"
+            fi
 
             echo ""
-            echo "## Git Activity"
+            echo "## Git & GitHub"
             _collect_git_activity "$target_date"
+            _collect_github_activity "$target_date"
 
             echo ""
             echo "## Claude Code Sessions"
@@ -1207,7 +1243,7 @@ cmd_backfill() {
             else
                 echo "*No captures*"
             fi
-        } > "$recap_file" 2>/dev/null
+        } >> "$recap_file" 2>/dev/null
 
         count=$((count + 1))
         echo "  [$count] $target_date"
