@@ -471,11 +471,12 @@ cmd_harvest() {
     local project_dir project_name
     local session_date session_time year_month duration_min
     local start_epoch end_epoch readable_project out_dir note_file
-    # Process each project's session index
-    for index_file in "$claude_dir"/*/sessions-index.json; do
-        [[ -f "$index_file" ]] || continue
-
-        project_dir="$(dirname "$index_file")"
+    # Iterate session transcripts directly. Older Claude Code versions wrote a
+    # sessions-index.json per project; Claude Code 2.x does not. Synthesizing
+    # the same session metadata from the .jsonl content avoids the dependency.
+    for project_dir in "$claude_dir"/*/; do
+        [[ -d "$project_dir" ]] || continue
+        project_dir="${project_dir%/}"
         project_name="$(basename "$project_dir")"
 
         # Apply project filter
@@ -483,18 +484,19 @@ cmd_harvest() {
             continue
         fi
 
-        # Extract all sessions as JSON lines for efficient processing
-        while IFS= read -r entry; do
+        for session_file in "$project_dir"/*.jsonl; do
+            [[ -f "$session_file" ]] || continue
 
-            session_id=$(echo "$entry" | jq -r '.sessionId // empty' 2>/dev/null) || continue
-            [[ -z "$session_id" ]] && continue
+            session_id="$(basename "$session_file" .jsonl)"
 
             # Skip already harvested
             if [[ -n "${harvested[$session_id]:-}" ]]; then
                 continue
             fi
 
-            message_count=$(echo "$entry" | jq -r '.messageCount // 0' 2>/dev/null) || continue
+            # Message count = number of `type: user` records in the transcript
+            message_count=$(jq -c 'select(.type == "user")' "$session_file" 2>/dev/null | wc -l | tr -d ' ')
+            [[ "$message_count" =~ ^[0-9]+$ ]] || message_count=0
 
             # Skip trivial sessions
             if [[ "$message_count" -le 2 ]] 2>/dev/null; then
@@ -502,13 +504,22 @@ cmd_harvest() {
                 continue
             fi
 
-            summary=$(echo "$entry" | jq -r '.summary // "No summary"' 2>/dev/null) || summary="No summary"
-            first_prompt=$(echo "$entry" | jq -r '.firstPrompt // ""' 2>/dev/null) || first_prompt=""
-            created=$(echo "$entry" | jq -r '.created // empty' 2>/dev/null) || continue
-            modified=$(echo "$entry" | jq -r '.modified // empty' 2>/dev/null) || modified=""
-            git_branch=$(echo "$entry" | jq -r '.gitBranch // ""' 2>/dev/null) || git_branch=""
-            project_path=$(echo "$entry" | jq -r '.projectPath // ""' 2>/dev/null) || project_path=""
-            full_path=$(echo "$entry" | jq -r '.fullPath // ""' 2>/dev/null) || full_path=""
+            # First user prompt content
+            first_prompt=$(jq -r 'select(.type == "user") | (.message.content // "" | tostring)' "$session_file" 2>/dev/null | head -1)
+
+            # Summary record (rare in 2.x .jsonl, but preserve compatibility)
+            summary=$(jq -r 'select(.type == "summary") | (.summary // empty)' "$session_file" 2>/dev/null | head -1)
+            [[ -z "$summary" ]] && summary="No summary"
+
+            # First/last record with a .timestamp
+            created=$(jq -r 'select(.timestamp) | .timestamp' "$session_file" 2>/dev/null | head -1)
+            [[ -z "$created" ]] && continue
+            modified=$(jq -r 'select(.timestamp) | .timestamp' "$session_file" 2>/dev/null | tail -1)
+
+            # gitBranch + cwd from the first record that has them
+            git_branch=$(jq -r 'select(.gitBranch) | .gitBranch' "$session_file" 2>/dev/null | head -1)
+            project_path=$(jq -r 'select(.cwd) | .cwd' "$session_file" 2>/dev/null | head -1)
+            full_path="$session_file"
 
             # Calculate date and duration
             session_date=""; session_time=""
@@ -569,7 +580,7 @@ cmd_harvest() {
 
             echo "$session_id" >> "$state_file"
             count=$((count + 1))
-        done < <(jq -c '.entries[]' "$index_file" 2>/dev/null)
+        done
     done
 
     echo "Harvested $count new sessions"
@@ -883,8 +894,12 @@ _collect_claude_sessions() {
         for session_file in "$project_dir"/*.jsonl(N); do
             [[ -f "$session_file" ]] || continue
 
-            # Check first line for timestamp and metadata
-            first_line=$(head -1 "$session_file" 2>/dev/null) || true
+            # Find the first line that has a timestamp + gitBranch (Claude Code
+            # 2.1.x uses metadata records like "last-prompt" / "permission-mode" as
+            # the literal first line; actual session entries with timestamps start
+            # from line 3 onward). Backward-compatible with older formats where
+            # line 1 already had a timestamp.
+            first_line=$(jq -c 'select(.timestamp)' "$session_file" 2>/dev/null | head -1) || true
             [[ -n "$first_line" ]] || continue
 
             ts=$(echo "$first_line" | jq -r '.timestamp // empty' 2>/dev/null) || true
