@@ -505,20 +505,20 @@ cmd_harvest() {
             fi
 
             # First user prompt content
-            first_prompt=$(jq -r 'select(.type == "user") | (.message.content // "" | tostring)' "$session_file" 2>/dev/null | head -1)
+            first_prompt=$(jq -nr 'first(inputs | select(.type == "user") | (.message.content // "" | tostring))' "$session_file" 2>/dev/null)
 
             # Summary record (rare in 2.x .jsonl, but preserve compatibility)
-            summary=$(jq -r 'select(.type == "summary") | (.summary // empty)' "$session_file" 2>/dev/null | head -1)
+            summary=$(jq -nr 'first(inputs | select(.type == "summary") | (.summary // empty))' "$session_file" 2>/dev/null)
             [[ -z "$summary" ]] && summary="No summary"
 
             # First/last record with a .timestamp
-            created=$(jq -r 'select(.timestamp) | .timestamp' "$session_file" 2>/dev/null | head -1)
+            created=$(jq -nr 'first(inputs | select(.timestamp) | .timestamp)' "$session_file" 2>/dev/null)
             [[ -z "$created" ]] && continue
             modified=$(jq -r 'select(.timestamp) | .timestamp' "$session_file" 2>/dev/null | tail -1)
 
             # gitBranch + cwd from the first record that has them
-            git_branch=$(jq -r 'select(.gitBranch) | .gitBranch' "$session_file" 2>/dev/null | head -1)
-            project_path=$(jq -r 'select(.cwd) | .cwd' "$session_file" 2>/dev/null | head -1)
+            git_branch=$(jq -nr 'first(inputs | select(.gitBranch) | .gitBranch)' "$session_file" 2>/dev/null)
+            project_path=$(jq -nr 'first(inputs | select(.cwd) | .cwd)' "$session_file" 2>/dev/null)
             full_path="$session_file"
 
             # Calculate date and duration
