@@ -455,8 +455,11 @@ _harvest_one_jsonl() {
     msg_count=$(jq -c 'select(.type == "user")' "$jsonl" 2>/dev/null | wc -l | tr -d ' ')
     [[ "$msg_count" =~ ^[0-9]+$ ]] || msg_count=0
 
-    local date="${first_ts:0:10}"
-    local time="${first_ts:11:5}"
+    # Use local time for dates (matches user mental model: "Friday evening" → Friday folder).
+    # Falls back to UTC string slice if `date -d` can't parse (alpine, etc.).
+    local date time
+    date=$(date -d "$first_ts" +%Y-%m-%d 2>/dev/null || echo "${first_ts:0:10}")
+    time=$(date -d "$first_ts" +%H:%M 2>/dev/null || echo "${first_ts:11:5}")
     local year_month="${date:0:7}"
 
     # Duration in minutes
@@ -541,7 +544,11 @@ _harvest_one_jsonl() {
         select(.type == "assistant")
         | (.message.content // [])
         | if type == "array" then .[] else empty end
-        | select(.type == "tool_use" and (.name == "Edit" or .name == "Write" or .name == "NotebookEdit"))
+        | select(.type == "tool_use" and (
+            .name == "Edit" or .name == "Write" or .name == "NotebookEdit"
+            or (.name | endswith("__edit_file"))
+            or (.name | endswith("__write_file"))
+          ))
         | .input.file_path // empty
     ' "$jsonl" 2>/dev/null | sort -u | sed 's/^/- /')
 
@@ -551,7 +558,7 @@ _harvest_one_jsonl() {
         select(.type == "assistant")
         | (.message.content // [])
         | if type == "array" then .[] else empty end
-        | select(.type == "tool_use" and .name == "Bash")
+        | select(.type == "tool_use" and (.name == "Bash" or (.name | endswith("__bash"))))
         | .input.command // empty
         | select(test("git commit|gh pr|gh issue"; "i"))
         | gsub("\n"; " ↵ ")
