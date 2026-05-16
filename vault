@@ -1078,6 +1078,8 @@ cmd_recap() {
     local month=$(echo "$target_date" | cut -d- -f2)
     local day=$(echo "$target_date" | cut -d- -f3)
     local recap_file="$VAULT_DIR/journal/$target_date.md"
+    local host
+    host=$(vault_hostname)
 
     # Pull latest vault state
     if [[ -d "$VAULT_DIR/.git" ]]; then
@@ -1086,29 +1088,34 @@ cmd_recap() {
 
     mkdir -p "$VAULT_DIR/journal"
 
-    # Append if file already has content, otherwise create fresh
-    local append_mode=false
+    # Determine mode:
+    #   fresh   — no file yet (or stub): write frontmatter + header + first
+    #             unwrapped recap (matches historical fresh-mode shape).
+    #   replace — file has a `## Auto-Recap (HOST)` block for THIS host: splice
+    #             the new content in place; preserves any other-host blocks
+    #             and any user-authored sections.
+    #   append  — file exists with content but no same-host wrapped block:
+    #             add a new wrapped block separated by `---`.
+    local mode="fresh"
     if [[ -f "$recap_file" ]]; then
-        local existing_size=$(wc -c < "$recap_file" | tr -d ' ')
-        (( existing_size > 200 )) && append_mode=true
+        local existing_size
+        existing_size=$(wc -c < "$recap_file" | tr -d ' ')
+        if (( existing_size > 200 )); then
+            if grep -qF "## Auto-Recap ($host)" "$recap_file"; then
+                mode="replace"
+            else
+                mode="append"
+            fi
+        fi
     fi
 
+    # Build the wrapped recap block (header + sections) to a temp file.
+    # Used by replace and append; fresh-mode writes its own top-of-file shape.
+    local block_tmp
+    block_tmp=$(mktemp)
     {
-        if $append_mode; then
-            echo ""
-            echo "---"
-            echo ""
-            echo "## Auto-Recap ($(vault_hostname))"
-            echo "_Generated at $(vault_time)_"
-        else
-            echo "---"
-            echo "created: $target_date"
-            echo "type: daily-recap"
-            echo "tags: [recap, journal]"
-            echo "---"
-            echo ""
-            echo "# $dow, $month/$day"
-        fi
+        echo "## Auto-Recap ($host)"
+        echo "_Generated at $(vault_time)_"
 
         echo ""
         echo "## Git & GitHub"
@@ -1135,20 +1142,76 @@ cmd_recap() {
         else
             echo "*No captures today*"
         fi
+    } > "$block_tmp"
 
-    } >> "$recap_file" 2>/dev/null
+    case "$mode" in
+        fresh)
+            {
+                echo "---"
+                echo "created: $target_date"
+                echo "type: daily-recap"
+                echo "tags: [recap, journal]"
+                echo "---"
+                echo ""
+                echo "# $dow, $month/$day"
+                echo ""
+                # Skip the `## Auto-Recap (HOST)` header in fresh-mode — the
+                # day's first recap stays in unwrapped form (matches the
+                # historical shape). Subsequent same-host runs will detect
+                # no wrapped block exists and go through append, which adds
+                # the wrapper for the first time.
+                sed -n '/^## Git & GitHub/,$p' "$block_tmp"
+            } > "$recap_file"
+            ;;
+        append)
+            {
+                echo ""
+                echo "---"
+                echo ""
+                cat "$block_tmp"
+            } >> "$recap_file"
+            ;;
+        replace)
+            # Splice new block in place. Boundaries: from `## Auto-Recap (HOST)`
+            # line through the line before the next `^---$` (or EOF). Awk
+            # streams through the file once and writes a new file atomically.
+            local spliced_tmp
+            spliced_tmp=$(mktemp)
+            awk -v host="$host" -v block_file="$block_tmp" '
+                BEGIN { state = 0; sub_pat = "^## Auto-Recap \\(" host "\\)$" }
+                state == 0 {
+                    if ($0 ~ sub_pat) {
+                        while ((getline line < block_file) > 0) print line
+                        close(block_file)
+                        state = 1
+                        next
+                    }
+                    print
+                    next
+                }
+                state == 1 {
+                    if (/^---$/) { state = 2; print; next }
+                    next   # skip lines from the old block
+                }
+                state == 2 { print }
+            ' "$recap_file" > "$spliced_tmp"
+            mv "$spliced_tmp" "$recap_file"
+            ;;
+    esac
+
+    rm -f "$block_tmp"
 
     # Also harvest Claude sessions as resource notes
     cmd_harvest 2>/dev/null || true
 
-    # Commit and push
+    # Commit and push (no-op if nothing changed)
     if [[ -d "$VAULT_DIR/.git" ]]; then
         (cd "$VAULT_DIR" && git add -A && \
-            git commit -m "recap: $target_date [$(vault_hostname)]" --quiet && \
+            git commit -m "recap: $target_date [$host]" --quiet && \
             git push --quiet) 2>/dev/null || true
     fi
 
-    echo "Recap written to $recap_file"
+    echo "Recap written to $recap_file (mode: $mode)"
 }
 
 cmd_weekly() {
