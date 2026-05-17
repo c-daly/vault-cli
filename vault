@@ -1210,7 +1210,7 @@ cmd_recap() {
     block_tmp=$(mktemp)
     {
         echo "## Auto-Recap ($host)"
-        echo "_Generated: $(vault_date)_"
+        echo "_Generated: $(vault_date) $(vault_time)_"
 
         echo ""
         echo "## Git & GitHub"
@@ -1290,7 +1290,22 @@ cmd_recap() {
                 }
                 state == 2 { print }
             ' "$recap_file" > "$spliced_tmp"
-            mv "$spliced_tmp" "$recap_file"
+
+            # Idempotency: if the new content matches existing modulo the
+            # `_Generated:` timestamp line, skip the write entirely. The
+            # file's mtime stays put, git sees a true no-op, and the
+            # `_Generated:` date only ticks when the recap content
+            # actually changes — not just because today's date is
+            # different from when the file was last meaningfully updated.
+            if diff -q \
+                <(grep -v '^_Generated:' "$recap_file") \
+                <(grep -v '^_Generated:' "$spliced_tmp") \
+                >/dev/null 2>&1; then
+                rm -f "$spliced_tmp"
+                mode="unchanged"
+            else
+                mv "$spliced_tmp" "$recap_file"
+            fi
             ;;
     esac
 
