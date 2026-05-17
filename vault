@@ -44,6 +44,32 @@ else
     _date_yesterday() { date -d "yesterday" +%Y-%m-%d; }
 fi
 
+# Resolve the canonical path for a journal entry, given a date and
+# kind. Daily notes and same-day recap files live under YYYY/MM/, e.g.
+#   $VAULT_DIR/journal/2026/05/2026-05-17.md
+# Weekly rollups live under the month their end-date falls in:
+#   $VAULT_DIR/journal/2026/05/week-2026-20.md
+# The nested layout keeps Obsidian's file tree navigable as the journal
+# grows past a few hundred entries; flat journal/ became unbrowsable
+# around 696 entries on this vault.
+_journal_path() {
+    local date="$1"
+    local kind="${2:-daily}"
+    local year="${date%%-*}"
+    local month
+    month=$(echo "$date" | cut -d- -f2)
+    case "$kind" in
+        weekly)
+            local week
+            week=$(_date_fmt "$date" +%V)
+            echo "$VAULT_DIR/journal/$year/$month/week-$year-$week.md"
+            ;;
+        *)
+            echo "$VAULT_DIR/journal/$year/$month/$date.md"
+            ;;
+    esac
+}
+
 # Convert a UTC ISO-8601 timestamp (Claude Code session timestamps end in
 # 'Z' and are always UTC, often with fractional seconds e.g.
 # "2026-05-17T01:17:03.513Z") to a LOCAL-time YYYY-MM-DD. Used to bucket
@@ -341,10 +367,11 @@ EOF
 cmd_daily() {
     local today
     today="$(vault_date)"
-    local daily_file="$VAULT_DIR/journal/$today.md"
+    local daily_file
+    daily_file=$(_journal_path "$today" daily)
     local template="$VAULT_DIR/_templates/daily.md"
 
-    mkdir -p "$VAULT_DIR/journal"
+    mkdir -p "$(dirname "$daily_file")"
 
     if [[ ! -f "$daily_file" ]]; then
         if [[ -f "$template" ]]; then
@@ -1234,7 +1261,8 @@ cmd_recap() {
     local dow=$(_date_fmt "$target_date" "+%A")
     local month=$(echo "$target_date" | cut -d- -f2)
     local day=$(echo "$target_date" | cut -d- -f3)
-    local recap_file="$VAULT_DIR/journal/$target_date.md"
+    local recap_file
+    recap_file=$(_journal_path "$target_date" daily)
     local host
     host=$(vault_hostname)
 
@@ -1243,7 +1271,7 @@ cmd_recap() {
         (cd "$VAULT_DIR" && git pull --rebase --quiet) 2>/dev/null || true
     fi
 
-    mkdir -p "$VAULT_DIR/journal"
+    mkdir -p "$(dirname "$recap_file")"
 
     # Determine mode:
     #   fresh   — no file yet (or stub): write frontmatter + header + first
@@ -1390,21 +1418,22 @@ cmd_weekly() {
     local start_date=$(_date_offset "$end_date" -6)
     local week_num=$(_date_fmt "$end_date" +%V)
     local year=$(echo "$end_date" | cut -d- -f1)
-    local weekly_file="$VAULT_DIR/journal/week-${year}-${week_num}.md"
+    local weekly_file
+    weekly_file=$(_journal_path "$end_date" weekly)
 
     # Pull latest
     if [[ -d "$VAULT_DIR/.git" ]]; then
         (cd "$VAULT_DIR" && git pull --rebase --quiet) 2>/dev/null || true
     fi
 
-    mkdir -p "$VAULT_DIR/journal"
+    mkdir -p "$(dirname "$weekly_file")"
 
     # Collect daily files
     local daily_files=()
     local current="$start_date"
     local daily
     while [[ "$current" < "$end_date" || "$current" == "$end_date" ]]; do
-        daily="$VAULT_DIR/journal/$current.md"
+        daily=$(_journal_path "$current" daily)
         [[ -f "$daily" ]] && daily_files+=("$daily")
         current=$(_date_offset "$current" +1)
     done
@@ -1481,7 +1510,7 @@ cmd_weekly() {
         current="$start_date"
         while [[ "$current" < "$end_date" || "$current" == "$end_date" ]]; do
             dow=$(_date_fmt "$current" "+%A")
-            if [[ -f "$VAULT_DIR/journal/$current.md" ]]; then
+            if [[ -f "$(_journal_path "$current" daily)" ]]; then
                 echo "- [[$current|$dow]]"
             else
                 echo "- $dow — *no recap*"
@@ -1552,7 +1581,6 @@ cmd_backfill() {
     if [[ -d "$VAULT_DIR/.git" ]]; then
         (cd "$VAULT_DIR" && git pull --rebase --quiet) 2>/dev/null || true
     fi
-    mkdir -p "$VAULT_DIR/journal"
 
     local count=0
     local dow month day recap_file inbox_file
@@ -1562,7 +1590,8 @@ cmd_backfill() {
         dow=$(_date_fmt "$target_date" "+%A")
         month=$(echo "$target_date" | cut -d- -f2)
         day=$(echo "$target_date" | cut -d- -f3)
-        recap_file="$VAULT_DIR/journal/$target_date.md"
+        recap_file=$(_journal_path "$target_date" daily)
+        mkdir -p "$(dirname "$recap_file")"
 
         # Append if file already has content, otherwise create fresh
         local append_mode=false
