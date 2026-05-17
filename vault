@@ -44,6 +44,42 @@ else
     _date_yesterday() { date -d "yesterday" +%Y-%m-%d; }
 fi
 
+# Convert a UTC ISO-8601 timestamp (Claude Code session timestamps end in
+# 'Z' and are always UTC, often with fractional seconds e.g.
+# "2026-05-17T01:17:03.513Z") to a LOCAL-time YYYY-MM-DD. Used to bucket
+# session activity by the local day it happened on, not the UTC day —
+# without this, evening sessions (when UTC has rolled over but local
+# hasn't) get filtered out of `vault recap today`. Uses jq to avoid the
+# Linux/macOS `date` divergence; jq is already a hard dep for harvest
+# and recap parsing.
+#
+# Implementation: jq's `fromdateiso8601` rejects fractional-second
+# timestamps, so strip the fractional part + Z, parse via strptime as
+# UTC broken-down time, convert to epoch via mktime, then format in
+# local time via strflocaltime.
+_iso_to_local_date() {
+    jq -nr --arg ts "$1" '
+        $ts
+        | sub("\\..*Z$|Z$"; "")
+        | strptime("%Y-%m-%dT%H:%M:%S")
+        | mktime
+        | strflocaltime("%Y-%m-%d")
+    ' 2>/dev/null
+}
+
+# As _iso_to_local_date, but returns the HH:MM portion in local time.
+# Kept as a parallel helper rather than merged with the date variant so
+# call sites can request whichever piece they need without the other.
+_iso_to_local_time() {
+    jq -nr --arg ts "$1" '
+        $ts
+        | sub("\\..*Z$|Z$"; "")
+        | strptime("%Y-%m-%dT%H:%M:%S")
+        | mktime
+        | strflocaltime("%H:%M")
+    ' 2>/dev/null
+}
+
 # --- Subcommands ---
 
 cmd_help() {
@@ -1010,7 +1046,7 @@ _collect_claude_sessions() {
 
     local session_count=0 output=""
     local project_name msg_count branch time_str
-    local proj_sessions proj_output first_line ts
+    local proj_sessions proj_output ts local_date first_meta
 
     for project_dir in "$CLAUDE_PROJECTS_DIR"/*(N/); do
         [[ -d "$project_dir" ]] || continue
@@ -1020,23 +1056,45 @@ _collect_claude_sessions() {
         for session_file in "$project_dir"/*.jsonl(N); do
             [[ -f "$session_file" ]] || continue
 
-            # Find the first line that has a timestamp + gitBranch (Claude Code
-            # 2.1.x uses metadata records like "last-prompt" / "permission-mode" as
-            # the literal first line; actual session entries with timestamps start
-            # from line 3 onward). Backward-compatible with older formats where
-            # line 1 already had a timestamp.
-            first_line=$(jq -c 'select(.timestamp)' "$session_file" 2>/dev/null | head -1) || true
-            [[ -n "$first_line" ]] || continue
-
-            ts=$(echo "$first_line" | jq -r '.timestamp // empty' 2>/dev/null) || true
+            # Pull timestamp + gitBranch from the first record that has a
+            # timestamp. Claude Code 2.1.x writes metadata records like
+            # "last-prompt" / "permission-mode" as the literal first line
+            # without a timestamp; the actual session entries with
+            # timestamps follow. Backward-compatible with older formats
+            # where line 1 already had a timestamp.
+            #
+            # NB: read directly from the file rather than capturing the
+            # first line into a variable and piping it back into jq via
+            # `echo`. Hook-event records (e.g. `hook_success`) embed
+            # nested escaped JSON in their `stdout` field; zsh's `echo`
+            # interprets the backslash escapes in that field and
+            # corrupts the line before jq can parse it, silently dropping
+            # those sessions. Single jq pass over the file avoids that
+            # round-trip.
+            first_meta=$(jq -r '
+                select(.timestamp)
+                | "\(.timestamp)\t\(.gitBranch // "—")"
+            ' "$session_file" 2>/dev/null | head -1) || true
+            [[ -n "$first_meta" ]] || continue
+            ts="${first_meta%%$'\t'*}"
+            branch="${first_meta#*$'\t'}"
             [[ -n "$ts" ]] || continue
 
-            # Match date
-            [[ "${ts%%T*}" == "$target_date" ]] || continue
-
-            branch=$(echo "$first_line" | jq -r '.gitBranch // "—"' 2>/dev/null) || true
+            # Match date in LOCAL time, not UTC. Session timestamps are
+            # UTC ('Z' suffix); naive `${ts%%T*}` extracts the UTC date,
+            # which silently drops evening sessions when UTC has rolled
+            # over but local hasn't. Mirrors the local-time fix that
+            # landed for harvest in b8effa8.
+            local_date=$(_iso_to_local_date "$ts") || true
+            [[ -n "$local_date" ]] || continue
+            [[ "$local_date" == "$target_date" ]] || continue
             msg_count=$(jq -r 'select(.type == "user")' "$session_file" 2>/dev/null | wc -l | tr -d ' ' || echo 0)
-            time_str=$(echo "$ts" | sed 's/.*T//' | cut -d. -f1 | cut -d: -f1-2)
+            # Display the session start time in LOCAL time to match the
+            # local-date bucketing above. Sessions filtered into a local
+            # day's recap shouldn't show UTC clock times — that's the
+            # same confusion the date filter used to cause.
+            time_str=$(_iso_to_local_time "$ts") || true
+            [[ -n "$time_str" ]] || time_str="${ts##*T}"
 
             proj_sessions=$((proj_sessions + 1))
             proj_output+="- $time_str — $msg_count messages"
