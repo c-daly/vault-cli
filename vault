@@ -966,10 +966,19 @@ _collect_git_activity() {
         [[ -d "$repo/.git" ]] || continue
         repo_name=$(basename "$repo")
 
+        # Filter out vault-cli's own auto-recap commit artifacts. These
+        # subjects (`recap: <date> [<host>]`, `weekly: ...`, `backfill:
+        # ...`) used to be created by recap/weekly/backfill themselves
+        # via auto-commit; we removed that in audit #34, but the
+        # historical commits remain in vault history and would otherwise
+        # flood the daily git-activity section with tooling noise that
+        # carries no signal about what the user did.
         log=$(git -C "$repo" log \
             --after="${target_date}T00:00:00" \
             --before="${target_date}T23:59:59" \
-            --pretty=format:"- %s (\`%h\`)" 2>/dev/null || true)
+            --pretty=format:"- %s (\`%h\`)" 2>/dev/null \
+            | grep -Ev '^- (recap|weekly|backfill): ' \
+            || true)
 
         if [[ -n "$log" ]]; then
             count=$(echo "$log" | wc -l | tr -d ' ')
@@ -1084,6 +1093,7 @@ _collect_claude_sessions() {
     local session_count=0 output=""
     local project_name msg_count branch time_str
     local proj_sessions proj_output ts local_date first_meta
+    local ai_title real_prompt_count first_prompt preview
 
     for project_dir in "$CLAUDE_PROJECTS_DIR"/*(N/); do
         [[ -d "$project_dir" ]] || continue
@@ -1125,7 +1135,6 @@ _collect_claude_sessions() {
             local_date=$(_iso_to_local_date "$ts") || true
             [[ -n "$local_date" ]] || continue
             [[ "$local_date" == "$target_date" ]] || continue
-            msg_count=$(jq -r 'select(.type == "user")' "$session_file" 2>/dev/null | wc -l | tr -d ' ' || echo 0)
             # Display the session start time in LOCAL time to match the
             # local-date bucketing above. Sessions filtered into a local
             # day's recap shouldn't show UTC clock times — that's the
@@ -1133,9 +1142,62 @@ _collect_claude_sessions() {
             time_str=$(_iso_to_local_time "$ts") || true
             [[ -n "$time_str" ]] || time_str="${ts##*T}"
 
+            # Count GENUINE user prompts, not raw user-type records. The
+            # raw count (every record with .type == "user") includes
+            # tool_result wrappers and command boilerplate, inflating
+            # the figure by 10–100x and burying real conversation depth.
+            # Mirrors the filter used in _harvest_one_jsonl's stub
+            # detector so "prompts" here means the same thing as
+            # "did the user actually type something" there.
+            real_prompt_count=$(jq -r '
+                select(.type == "user")
+                | .message.content
+                | if type == "string" then .
+                  elif type == "array" then
+                    if any(.type == "tool_result") then empty
+                    else ([.[] | select(.type == "text") | .text] | join("\n"))
+                    end
+                  else empty
+                  end
+                | select(length > 0)
+                | select(test("^<(command|local-command)-") | not)
+            ' "$session_file" 2>/dev/null | wc -l | tr -d ' ') || real_prompt_count=0
+            [[ "$real_prompt_count" =~ ^[0-9]+$ ]] || real_prompt_count=0
+
+            # Preview: prefer the AI-generated session title if present
+            # (Claude Code emits a `.type == "ai-title"` record with a
+            # short summary), else fall back to the first genuine user
+            # prompt truncated to ~100 chars. Either way the line tells
+            # the reader what the session was about without forcing a
+            # click through to the harvested note.
+            ai_title=$(jq -r 'select(.type == "ai-title") | .aiTitle // empty' "$session_file" 2>/dev/null | head -1) || ai_title=""
+            first_prompt=$(jq -r '
+                select(.type == "user")
+                | .message.content
+                | if type == "string" then .
+                  elif type == "array" then
+                    if any(.type == "tool_result") then empty
+                    else ([.[] | select(.type == "text") | .text] | join("\n"))
+                    end
+                  else empty
+                  end
+                | select(length > 0)
+                | select(test("^<(command|local-command)-") | not)
+                | gsub("\n"; " ")
+            ' "$session_file" 2>/dev/null | head -1) || first_prompt=""
+
+            preview=""
+            if [[ -n "$ai_title" ]]; then
+                preview="$ai_title"
+            elif [[ -n "$first_prompt" ]]; then
+                preview="${first_prompt:0:100}"
+                [[ ${#first_prompt} -gt 100 ]] && preview="${preview}…"
+            fi
+
             proj_sessions=$((proj_sessions + 1))
-            proj_output+="- $time_str — $msg_count messages"
+            proj_output+="- $time_str — $real_prompt_count prompts"
             [[ "$branch" != "—" ]] && proj_output+=" (branch: \`$branch\`)"
+            [[ -n "$preview" ]] && proj_output+=" — \"$preview\""
             proj_output+=$'
 '
         done
@@ -1241,6 +1303,14 @@ cmd_recap() {
 
     case "$mode" in
         fresh)
+            # Always write the `## Auto-Recap (HOST)` wrapper, even on
+            # fresh-mode (the first recap of a date). Without it,
+            # subsequent same-host runs would land in append/replace and
+            # leave the original unwrapped content stale at the top of
+            # the file — producing two contradictory `## Git & GitHub`
+            # sections, two `## Claude Code Sessions`, etc. With the
+            # wrapper from the start, every subsequent run goes through
+            # replace (idempotent) and the file converges.
             {
                 echo "---"
                 echo "created: $target_date"
@@ -1250,12 +1320,7 @@ cmd_recap() {
                 echo ""
                 echo "# $dow, $month/$day"
                 echo ""
-                # Skip the `## Auto-Recap (HOST)` header in fresh-mode — the
-                # day's first recap stays in unwrapped form (matches the
-                # historical shape). Subsequent same-host runs will detect
-                # no wrapped block exists and go through append, which adds
-                # the wrapper for the first time.
-                sed -n '/^## Git & GitHub/,$p' "$block_tmp"
+                cat "$block_tmp"
             } > "$recap_file"
             ;;
         append)
