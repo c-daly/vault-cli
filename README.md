@@ -20,7 +20,7 @@ Obsidian is great for linking and visualizing notes, but opening a GUI app to jo
 | `vault daily` | Create or open today's daily note (`journal/<date>.md`) |
 | `vault search [query]` | Search vault with ripgrep + fzf (content and filenames) |
 | `vault recent [N]` | Show N most recently modified notes (default: 10) |
-| `vault harvest [--all] [--project N] [--sync]` | Import Claude Code session metadata as vault notes |
+| `vault harvest [--all] [--project N] [--sync] [--keep-stubs]` | Import Claude Code session metadata as vault notes (skips stub sessions — `/exit`-only or opened-and-quit — unless `--keep-stubs`) |
 | `vault recap [today\|yesterday\|DATE]` | Generate daily recap from activity (writes only — run `sync` after) |
 | `vault weekly [end-date]` | Weekly rollup from daily recaps (writes only — run `sync` after) |
 | `vault backfill` | Generate recaps for all past dates with activity (writes only — run `sync` after) |

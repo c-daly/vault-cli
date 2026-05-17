@@ -94,7 +94,7 @@ Commands:
   daily                           Create/open today's daily note (journal/)
   recent [N]                      Show recently modified notes (default: 10)
   search <query>                  Search vault with fzf + ripgrep
-  harvest [--all] [--project N] [--sync]   Import Claude Code sessions
+  harvest [--all] [--project N] [--sync] [--keep-stubs]   Import Claude Code sessions
   recap [today|yesterday|DATE]    Generate daily recap (bundle: harvest + activity summary;
                                   writes files, does NOT commit — run `vault sync`)
   weekly [end-date]               Weekly rollup from daily recaps (writes only; run sync)
@@ -471,6 +471,7 @@ _harvest_one_jsonl() {
     local hostname="$2"
     local output_root="$3"
     local force="${4:-false}"
+    local keep_stubs="${5:-false}"
 
     local sid is_subagent=false parent_sid="" agent_id=""
     sid="$(basename "$jsonl" .jsonl)"
@@ -574,6 +575,38 @@ _harvest_one_jsonl() {
         | select(length > 0)
         | gsub("\n"; " ¶ ")
     ' "$jsonl" 2>/dev/null | nl -ba -w2 -s'. ' | sed 's/^/   /')
+
+    # Stub detection: count user turns that look like genuine typed input
+    # (not the `<command-name>/exit</command-name>` and
+    # `<local-command-caveat>...</local-command-caveat>` boilerplate that
+    # Claude Code emits for slash-commands and session-frame metadata).
+    # A "stub" session has zero genuine turns — typically /exit-only or
+    # opened-and-quit. Skip writing the .md file for those, and delete a
+    # previously-harvested stub file so existing noise gets cleaned up
+    # on re-harvest. `--keep-stubs` opts back in.
+    local real_user_count
+    real_user_count=$(jq -r '
+        select(.type == "user")
+        | .message.content
+        | if type == "string" then .
+          elif type == "array" then
+            if any(.type == "tool_result") then empty
+            else ([.[] | select(.type == "text") | .text] | join("\n"))
+            end
+          else empty
+          end
+        | select(length > 0)
+        | select(test("^<(command|local-command)-") | not)
+    ' "$jsonl" 2>/dev/null | wc -l | tr -d ' ')
+    [[ "$real_user_count" =~ ^[0-9]+$ ]] || real_user_count=0
+
+    if [[ "$keep_stubs" != "true" ]] && (( real_user_count == 0 )); then
+        # Retroactive cleanup: if this session was previously harvested
+        # (back when the stub filter didn't exist), delete the stale file
+        # so re-harvest converges on the new policy.
+        [[ -f "$out_file" ]] && rm -f "$out_file"
+        return 3
+    fi
 
     # Files written/edited
     local files
@@ -700,12 +733,14 @@ cmd_harvest() {
     local harvest_all=false   # legacy flag, accepted but now no-op (harvest is always idempotent)
     local project_filter=""
     local do_sync=false
+    local keep_stubs=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --all) harvest_all=true; shift ;;
             --project) project_filter="$2"; shift 2 ;;
             --sync) do_sync=true; shift ;;
+            --keep-stubs) keep_stubs=true; shift ;;
             *) echo "Unknown option: $1" >&2; exit 1 ;;
         esac
     done
@@ -727,7 +762,7 @@ cmd_harvest() {
     local hostname
     hostname="$(vault_hostname)"
 
-    local updated=0 unchanged=0 errors=0 scanned=0
+    local updated=0 unchanged=0 errors=0 stubs=0 scanned=0
 
     local jsonl rc
     while IFS= read -r -d '' jsonl; do
@@ -738,15 +773,16 @@ cmd_harvest() {
         fi
 
         rc=0
-        _harvest_one_jsonl "$jsonl" "$hostname" "$output_root" "$harvest_all" || rc=$?
+        _harvest_one_jsonl "$jsonl" "$hostname" "$output_root" "$harvest_all" "$keep_stubs" || rc=$?
         case $rc in
             0) updated=$((updated+1)) ;;
             1) unchanged=$((unchanged+1)) ;;
+            3) stubs=$((stubs+1)) ;;
             *) errors=$((errors+1)) ;;
         esac
     done < <(find "$claude_dir" -name "*.jsonl" -type f -print0 2>/dev/null)
 
-    echo "Harvested: $updated updated, $unchanged unchanged, $errors errors ($scanned scanned)"
+    echo "Harvested: $updated updated, $unchanged unchanged, $stubs stubs skipped, $errors errors ($scanned scanned)"
 
     if $do_sync; then
         cmd_sync
