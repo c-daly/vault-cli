@@ -12,19 +12,33 @@ Obsidian is great for linking and visualizing notes, but opening a GUI app to jo
 
 | Command | Description |
 |---------|-------------|
-| `vault add "thought"` | Quick capture to today's daily file |
+| `vault add "thought"` | Quick capture to today's captures file (`00-inbox/<date>.md`) |
 | `vault add "idea" -t project` | Capture with category tag (`fleeting`, `project`, `learning`) |
 | `vault process` | Open today's captures in your editor to review and tag |
 | `vault process --commit` | Split tagged entries into individual notes in the right folders |
 | `vault edit [-t type]` | Create a new note from template and open in editor |
-| `vault daily` | Create or open today's daily note |
+| `vault daily` | Create or open today's daily note (`journal/<date>.md`) |
 | `vault search [query]` | Search vault with ripgrep + fzf (content and filenames) |
 | `vault recent [N]` | Show N most recently modified notes (default: 10) |
-| `vault harvest` | Import Claude Code session metadata as vault notes |
-| `vault sync` | Git add, commit, pull --rebase, push |
-| `vault recap [today\|yesterday\|DATE]` | Auto-generate daily recap from activity |
-| `vault weekly [end-date]` | Weekly rollup from daily recaps |
+| `vault harvest [--all] [--project N] [--sync]` | Import Claude Code session metadata as vault notes |
+| `vault recap [today\|yesterday\|DATE]` | Generate daily recap from activity (writes only — run `sync` after) |
+| `vault weekly [end-date]` | Weekly rollup from daily recaps (writes only — run `sync` after) |
+| `vault backfill` | Generate recaps for all past dates with activity (writes only — run `sync` after) |
+| `vault sync` | `git add -A` + commit + `pull --rebase` + push |
 | `vault help` | Show usage |
+
+### What `recap` actually bundles
+
+`vault recap` is a composite command, not a single action. A single invocation runs:
+
+1. `git pull --rebase --quiet` on the vault, so the recap reflects the latest synced state.
+2. `vault harvest` (no flags), which scans `~/.claude/projects/*/*.jsonl` and writes/updates session-metadata notes under `30-resources/claude-sessions/`. Harvest is idempotent — re-runs leave unchanged files alone.
+3. Activity collection: shell history (`$HISTFILE`), git commit log across `$VAULT_REPOS_DIR` (default `~/projects`), GitHub PRs/issues via `gh`, today's captures from `00-inbox/`, Claude session summaries (local-day bucketing), and calendar entries if `gcalcli` is installed.
+4. Writes the recap markdown to `journal/<date>.md`. First run for a date writes in *fresh* mode (unwrapped); subsequent runs splice an `## Auto-Recap (<host>)` wrapped block in *replace* or *append* mode.
+
+The recap **does not commit or push.** Run `vault sync` when you want the changes published. Same for `weekly` and `backfill`.
+
+`vault harvest --sync` is the only harvest command that also calls `vault sync` after — useful from cron/hooks where there's no human to invoke sync separately.
 
 ## Install
 

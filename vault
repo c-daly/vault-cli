@@ -87,19 +87,20 @@ cmd_help() {
 Usage: vault <command> [options]
 
 Commands:
-  add <text> [-t type]   Quick capture to today's daily file
-  process [date]         Review and categorize captures
-  process --commit       Split categorized entries into notes
-  edit [-t type]         Create note from template, open in editor
-  daily                  Create/open today's daily note
-  search <query>         Search vault with fzf + ripgrep
-  sync                   Git commit + pull + push
-  harvest [--all] [--project <name>]  Import Claude Code sessions
-  recent [N]             Show recently modified notes (default: 10)
-  recap [today|yesterday|DATE]  Auto-generate daily recap from activity
-  backfill                Generate recaps for all past dates with activity
-  weekly [end-date]      Weekly rollup from daily recaps
-  help                   Show this help
+  add <text> [-t type]            Quick capture to today's captures file (00-inbox/)
+  process [date]                  Review and categorize captures
+  process --commit                Split categorized entries into notes
+  edit [-t type]                  Create note from template, open in editor
+  daily                           Create/open today's daily note (journal/)
+  recent [N]                      Show recently modified notes (default: 10)
+  search <query>                  Search vault with fzf + ripgrep
+  harvest [--all] [--project N] [--sync]   Import Claude Code sessions
+  recap [today|yesterday|DATE]    Generate daily recap (bundle: harvest + activity summary;
+                                  writes files, does NOT commit — run `vault sync`)
+  weekly [end-date]               Weekly rollup from daily recaps (writes only; run sync)
+  backfill                        Generate recaps for all past dates with activity (writes only; run sync)
+  sync                            git add -A + commit + pull --rebase + push
+  help                            Show this help
 HELP
 }
 
@@ -1173,7 +1174,7 @@ cmd_recap() {
     block_tmp=$(mktemp)
     {
         echo "## Auto-Recap ($host)"
-        echo "_Generated at $(vault_time)_"
+        echo "_Generated: $(vault_date)_"
 
         echo ""
         echo "## Git & GitHub"
@@ -1259,17 +1260,13 @@ cmd_recap() {
 
     rm -f "$block_tmp"
 
-    # Also harvest Claude sessions as resource notes
-    cmd_harvest 2>/dev/null || true
-
-    # Commit and push (no-op if nothing changed)
-    if [[ -d "$VAULT_DIR/.git" ]]; then
-        (cd "$VAULT_DIR" && git add -A && \
-            git commit -m "recap: $target_date [$host]" --quiet && \
-            git push --quiet) 2>/dev/null || true
-    fi
+    # Also harvest Claude sessions as resource notes. Don't silently
+    # swallow harvest stderr — if harvest is broken the user should see
+    # it. `|| true` keeps recap going so the journal still updates.
+    cmd_harvest || true
 
     echo "Recap written to $recap_file (mode: $mode)"
+    echo "Run \`vault sync\` to commit + push."
 }
 
 cmd_weekly() {
@@ -1390,14 +1387,8 @@ cmd_weekly() {
 
     } > "$weekly_file"
 
-    # Commit and push
-    if [[ -d "$VAULT_DIR/.git" ]]; then
-        (cd "$VAULT_DIR" && git add -A && \
-            git commit -m "weekly: week $week_num [$(vault_hostname)]" --quiet && \
-            git push --quiet) 2>/dev/null || true
-    fi
-
     echo "Weekly rollup written to $weekly_file"
+    echo "Run \`vault sync\` to commit + push."
 }
 
 cmd_backfill() {
@@ -1514,14 +1505,8 @@ cmd_backfill() {
     # Harvest once
     cmd_harvest 2>/dev/null || true
 
-    # Commit and push once
-    if [[ -d "$VAULT_DIR/.git" ]]; then
-        (cd "$VAULT_DIR" && git add -A && \
-            git commit -m "backfill: $count recaps [$(vault_hostname)]" --quiet && \
-            git push --quiet) 2>/dev/null || true
-    fi
-
     echo "Backfilled $count recaps"
+    echo "Run \`vault sync\` to commit + push."
 }
 
 # --- Dispatch ---
