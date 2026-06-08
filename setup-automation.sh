@@ -116,18 +116,18 @@ install_cron() {
 
     (crontab -l 2>/dev/null; cat <<CRON
 
-# vault-cli: daily recap at 11:00 PM
-0 23 * * * /home/cddal/.local/bin/vault recap >> /home/cddal/.local/log/vault-recap.log 2>&1
+# vault-cli: daily recap + sync at 11:00 PM
+0 23 * * * $VAULT_BIN recap >> $LOG_DIR/vault-recap.log 2>&1 && $VAULT_BIN sync >> $LOG_DIR/vault-sync.log 2>&1
 
-# vault-cli: weekly rollup at 11:30 PM on Sundays
-30 23 * * 0 /home/cddal/.local/bin/vault weekly >> /home/cddal/.local/log/vault-weekly.log 2>&1
+# vault-cli: weekly rollup + sync at 11:30 PM on Sundays
+30 23 * * 0 $VAULT_BIN weekly >> $LOG_DIR/vault-weekly.log 2>&1 && $VAULT_BIN sync >> $LOG_DIR/vault-sync.log 2>&1
 CRON
     ) | crontab -
 
     echo "Cron jobs installed:"
-    echo "  Daily recap:   0 23 * * *   /home/cddal/.local/bin/vault recap"
-    echo "  Weekly rollup: 30 23 * * 0  /home/cddal/.local/bin/vault weekly"
-    echo "  Logs:          /home/cddal/.local/log/vault-{recap,weekly}.log"
+    echo "  Daily recap:   0 23 * * *   $VAULT_BIN recap && sync"
+    echo "  Weekly rollup: 30 23 * * 0  $VAULT_BIN weekly && sync"
+    echo "  Logs:          $LOG_DIR/vault-{recap,weekly,sync}.log"
 }
 
 uninstall_cron() {
