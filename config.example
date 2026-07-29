@@ -12,3 +12,20 @@ VAULT_DIR="~/projects/vault"
 
 # Recap: enable Google Calendar integration (requires gcalcli)
 # VAULT_GCAL_ENABLED="true"
+
+# Recap/harvest source roots. Both are colon-separated and skip roots that
+# don't exist, so one config can be shared across machines.
+#
+# Set these on a WSL install that also does Windows-side work: repos under
+# C:\Users\<user> and sessions started from PowerShell are invisible to the
+# defaults, which only see $HOME.
+# VAULT_REPOS_DIR="$HOME/projects:/mnt/c/Users/<user>"
+# VAULT_CLAUDE_DIRS="$HOME/.claude/projects:/mnt/c/Users/<user>/.claude/projects"
+
+# Daily narrative (LLM diary summary; NARRATE=0 disables)
+NARRATE=1
+NARRATE_MODEL="haiku"
+
+# Gmail diary source: app-password IMAP; leave empty to disable
+VAULT_GMAIL_USER=""
+VAULT_GMAIL_APP_PASSWORD=""

@@ -20,7 +20,7 @@ Obsidian is great for linking and visualizing notes, but opening a GUI app to jo
 | `vault daily` | Create or open today's daily note (`journal/<date>.md`) |
 | `vault search [query]` | Search vault with ripgrep + fzf (content and filenames) |
 | `vault recent [N]` | Show N most recently modified notes (default: 10) |
-| `vault harvest [--all] [--project N] [--sync] [--keep-stubs]` | Import Claude Code session metadata as vault notes (skips stub sessions — `/exit`-only or opened-and-quit — unless `--keep-stubs`) |
+| `vault harvest [--all] [--project N] [--sync] [--keep-stubs] [--memory\|--no-memory]` | Import Claude Code session metadata as vault notes (skips stub sessions — `/exit`-only or opened-and-quit — unless `--keep-stubs`), then mirror built-in auto-memory. `--memory` mirrors only (seconds, no session scan); `--no-memory` skips the mirror |
 | `vault recap [today\|yesterday\|DATE]` | Generate daily recap from activity (writes only — run `sync` after) |
 | `vault weekly [end-date]` | Weekly rollup from daily recaps (writes only — run `sync` after) |
 | `vault backfill` | Generate recaps for all past dates with activity (writes only — run `sync` after) |
@@ -32,7 +32,9 @@ Obsidian is great for linking and visualizing notes, but opening a GUI app to jo
 `vault recap` is a composite command, not a single action. A single invocation runs:
 
 1. `git pull --rebase --quiet` on the vault, so the recap reflects the latest synced state.
-2. `vault harvest` (no flags), which scans `~/.claude/projects/*/*.jsonl` and writes/updates session-metadata notes under `30-resources/claude-sessions/`. Harvest is idempotent — re-runs leave unchanged files alone.
+2. `vault harvest` (no flags), which scans `$VAULT_CLAUDE_DIRS/*/*.jsonl` and writes/updates session-metadata notes under `30-resources/claude-sessions/`, then mirrors built-in per-project auto-memory (`<root>/<project>/memory/*.md`) into `30-resources/claude-memory/`. Both halves are idempotent — re-runs leave unchanged files alone.
+
+   The auto-memory mirror is verbatim and read-only. Claude's built-in store is keyed by working directory and has no `subject` field, so an entry can be *about the user* yet live under whichever project it was learned in. The mirror preserves that rather than guessing a subject; curating across projects belongs to the continuity plugin.
 3. Activity collection: shell history (`$HISTFILE`), git commit log across `$VAULT_REPOS_DIR` (default `~/projects`), GitHub PRs/issues via `gh`, today's captures from `00-inbox/`, Claude session summaries (local-day bucketing), and calendar entries if `gcalcli` is installed.
 4. Writes the recap markdown to `journal/<date>.md`. First run for a date writes in *fresh* mode (unwrapped); subsequent runs splice an `## Auto-Recap (<host>)` wrapped block in *replace* or *append* mode.
 
@@ -116,8 +118,9 @@ Commits with hostname and timestamp, pulls with rebase, pushes. Run on each mach
 ### Harvest Claude Code sessions
 
 ```bash
-vault harvest                    # new sessions since last run
+vault harvest                    # new sessions since last run, then mirror auto-memory
 vault harvest --all              # re-harvest everything
+vault harvest --memory           # mirror auto-memory only (seconds)
 vault harvest --project LOGOS    # filter by project name
 vault harvest --sync             # harvest + sync in one
 ```
