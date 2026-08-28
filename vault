@@ -1303,7 +1303,10 @@ def harvest(M, mailbox):
     return lines
 
 try:
-    M = imaplib.IMAP4_SSL("imap.gmail.com")
+    # Bounded: every IMAP op below inherits this socket timeout. Without it a
+    # blackholed connection hangs the entire recap instead of degrading to the
+    # "unavailable" note.
+    M = imaplib.IMAP4_SSL("imap.gmail.com", timeout=int(os.environ.get("GMAIL_TIMEOUT", "20")))
     M.login(user, pw)
 except Exception:
     sys.exit(1)
