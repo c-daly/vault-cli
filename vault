@@ -221,12 +221,57 @@ _canonical_path() {
 }
 
 typeset -gA _THREAD_ROOT_CACHE=()
+typeset -gA _REPO_ID_CACHE=()
 
-# Thread key for a working directory: the repo root where one is discoverable,
-# otherwise the canonical path. Resolving to the root is what lets a session run
-# from a subdirectory (`HexWars/Assets/HexWars/Presentation`) join that repo's
-# commits. Fail-soft by design — a path that has since moved or is unreachable
-# keeps its canonical form rather than being dropped.
+# Machine-independent identity for a repo: its origin remote, normalized so that
+# transport and scheme do not matter.
+#
+#   git@github.com:c-daly/vault.git      -> github.com/c-daly/vault
+#   https://github.com/c-daly/vault.git  -> github.com/c-daly/vault
+#
+# An absolute path cannot serve as the thread key, because it encodes a username
+# and a mount layout. That breaks joins across the three machines this vault
+# syncs between — and it already breaks them on ONE machine: the vault repo is
+# cloned at both ~/projects/vault (Claude's) and /mnt/c/vault (Obsidian's), and
+# those are the same repo. Per-host write partitions exist precisely so that
+# READS can key on the work thread rather than the host; a host-specific key
+# would defeat that.
+#
+# With no remote, fall back to a deliberately HOST-SCOPED key. Nothing then
+# proves two same-looking paths on different machines are the same thing, and an
+# unqualified path would silently claim they are. An honestly machine-scoped key
+# beats a false join.
+_repo_identity() {
+    local root="$1"
+    [[ -n "$root" ]] || return 0
+    if [[ -n "${_REPO_ID_CACHE[$root]:-}" ]]; then
+        printf '%s' "${_REPO_ID_CACHE[$root]}"
+        return 0
+    fi
+    local url="" id=""
+    if [[ -d "$root" ]]; then
+        url=$(git -C "$root" remote get-url origin 2>/dev/null) || url=""
+    fi
+    if [[ -n "$url" ]]; then
+        id="${url#*://}"    # drop scheme
+        id="${id#*@}"       # drop user@
+        id="${id/://}"      # scp-style host:owner/repo -> host/owner/repo
+        id="${id%.git}"
+        id="${id%/}"
+    else
+        id="$(vault_hostname):$root"
+    fi
+    _REPO_ID_CACHE[$root]="$id"
+    printf '%s' "$id"
+}
+
+# Thread key for a working directory: the identity of the repo containing it.
+#
+# Walking up to the repo root is what lets a session run from a subdirectory
+# (`HexWars/Assets/HexWars/Presentation`) join that repo's commits; turning the
+# root into a remote-derived identity is what lets it join across clones and
+# across machines. Fail-soft by design — an unreachable or moved path is
+# host-scoped rather than dropped.
 _thread_key() {
     local p
     p="$(_canonical_path "$1")"
@@ -235,13 +280,19 @@ _thread_key() {
         printf '%s' "${_THREAD_ROOT_CACHE[$p]}"
         return 0
     fi
-    local root=""
+    local root="" key=""
     if [[ -d "$p" ]]; then
         root=$(git -C "$p" rev-parse --show-toplevel 2>/dev/null) || root=""
     fi
-    [[ -n "$root" ]] || root="$p"
-    _THREAD_ROOT_CACHE[$p]="$root"
-    printf '%s' "$root"
+    if [[ -n "$root" ]]; then
+        key="$(_repo_identity "$root")"
+    else
+        # Not a repo, or gone. Host-scope it: a bare `/home/<user>/notes` would
+        # otherwise collide with an unrelated same-named path on another machine.
+        key="$(vault_hostname):$p"
+    fi
+    _THREAD_ROOT_CACHE[$p]="$key"
+    printf '%s' "$key"
 }
 
 # Month partition for a given LOCAL date. Monthly keeps a single file browsable
