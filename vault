@@ -29,6 +29,12 @@ _claude_roots() {
     done
 }
 
+# Unambiguous end-of-block marker for `## Auto-Recap (HOST)` sections. An HTML
+# comment renders as nothing in Obsidian and cannot collide with note content
+# the way a bare `---` can (inbox captures are spliced in verbatim, and YAML
+# separators inside them used to be mistaken for the block boundary).
+RECAP_END="<!-- /auto-recap -->"
+
 # Gmail diary source (metadata-only IMAP harvest; both must be set to enable)
 GMAIL_USER="${VAULT_GMAIL_USER:-}"
 GMAIL_APP_PASSWORD="${VAULT_GMAIL_APP_PASSWORD:-}"
@@ -1632,11 +1638,15 @@ cmd_recap() {
                 echo "# $dow, $month/$day"
                 echo ""
                 cat "$block_tmp"
-                # Terminate the Auto-Recap block with a `---` separator so a
-                # later same-host run (which goes through `replace`) has a
-                # boundary to splice up to. Without it, replace-mode awk runs
-                # from `## Auto-Recap` to EOF and would clobber any
-                # user-authored content appended below the recap.
+                # Terminate the Auto-Recap block so a later same-host run
+                # (which goes through `replace`) has a boundary to splice up
+                # to. Without it, replace-mode awk runs from `## Auto-Recap`
+                # to EOF and would clobber user-authored content below.
+                #
+                # The sentinel, not the `---`, is the real boundary: raw inbox
+                # captures are inserted verbatim into the block and may contain
+                # a bare `---`, which would otherwise be mistaken for the end.
+                echo "$RECAP_END"
                 echo ""
                 echo "---"
             } > "$recap_file"
@@ -1647,6 +1657,10 @@ cmd_recap() {
                 echo "---"
                 echo ""
                 cat "$block_tmp"
+                # Terminate the appended block too. Omitting this was the bug:
+                # appended blocks were unbounded, so the next same-host replace
+                # deleted everything below them.
+                echo "$RECAP_END"
             } >> "$recap_file"
             ;;
         replace)
@@ -1662,7 +1676,28 @@ cmd_recap() {
             # replace-mode idempotent even against an already-duplicated file.
             local spliced_tmp
             spliced_tmp=$(mktemp)
-            awk -v host="$host" -v block_file="$block_tmp" '
+
+            # Guard before splicing: a pre-existing same-host block with NO
+            # terminator (every recap written before the terminator fix, plus
+            # every append-mode block) makes the splice run to EOF and silently
+            # delete whatever the user wrote below it. That case is not
+            # recoverable by inspection — the old block body and the user's own
+            # text are indistinguishable — so keep a backup instead of guessing.
+            local legacy_unterminated=0
+            awk -v host="$host" -v recap_end="$RECAP_END" '
+                BEGIN { seen = 0; found = 0; sub_pat = "^## Auto-Recap \\(" host "\\)$" }
+                !seen && $0 ~ sub_pat { seen = 1; next }
+                seen && ($0 == recap_end || /^---$/) { found = 1; exit }
+                END { exit (seen && !found) ? 1 : 0 }
+            ' "$recap_file" || legacy_unterminated=1
+
+            if (( legacy_unterminated )); then
+                cp "$recap_file" "${recap_file}.pre-recap.bak"
+                print -u2 "  ! ${recap_file:t}: existing recap block has no terminator;"
+                print -u2 "    backed up to ${recap_file:t}.pre-recap.bak before splicing"
+            fi
+
+            awk -v host="$host" -v block_file="$block_tmp" -v recap_end="$RECAP_END" '
                 BEGIN { state = 0; sub_pat = "^## Auto-Recap \\(" host "\\)$" }
                 state == 0 {
                     if ($0 ~ sub_pat) {
@@ -1675,18 +1710,21 @@ cmd_recap() {
                     next
                 }
                 state == 1 {
-                    if (/^---$/) { state = 2; print; next }
+                    if ($0 == recap_end) { state = 2; print; next }
+                    # Legacy block terminated by a bare `---`: emit the sentinel
+                    # as we pass, migrating the file to the unambiguous marker.
+                    if (/^---$/) { print recap_end; print ""; state = 2; print; next }
                     next   # skip lines from the old (first) block
                 }
                 state == 2 {
                     # A further same-host block: a leftover dupe. Drop it and
-                    # the `---` that terminates it.
+                    # whichever terminator ends it.
                     if ($0 ~ sub_pat) { state = 3; next }
                     print
                     next
                 }
                 state == 3 {
-                    if (/^---$/) { state = 2; next }   # consume dupe terminator
+                    if ($0 == recap_end || /^---$/) { state = 2; next }
                     next   # skip the dupe block body
                 }
             ' "$recap_file" > "$spliced_tmp"
