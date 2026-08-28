@@ -188,6 +188,7 @@ EVENTS_DIR="${VAULT_EVENTS_DIR:-$VAULT_DIR/events}"
 
 typeset -gA _EVENT_SEEN=()
 typeset -gA _EVENT_PARTITION_LOADED=()
+typeset -gA _EVENT_PARTITION_LINES=()
 
 # Canonicalize a path so the SAME directory, reported by different clients,
 # collapses to one string. A session started from PowerShell reports
@@ -311,13 +312,50 @@ _event_load_partition() {
     local f="$1"
     [[ -n "${_EVENT_PARTITION_LOADED[$f]:-}" ]] && return 0
     _EVENT_PARTITION_LOADED[$f]=1
-    [[ -f "$f" ]] || return 0
-    local id
-    while IFS= read -r id; do
-        [[ -n "$id" ]] && _EVENT_SEEN[$id]=1
-    done < <(jq -r '.id // empty' "$f" 2>/dev/null || true)
+    _EVENT_PARTITION_LINES[$f]=0
+    _event_refresh_partition "$f"
     return 0
 }
+
+# Pick up ids appended by ANOTHER process since we last looked. Only the new
+# tail is parsed, so this stays cheap no matter how large the partition grows.
+_event_refresh_partition() {
+    local f="$1"
+    local have="${_EVENT_PARTITION_LINES[$f]:-0}" now=0 id
+    [[ -f "$f" ]] || { _EVENT_PARTITION_LINES[$f]=0; return 0; }
+    now=$(wc -l < "$f" 2>/dev/null | tr -d ' ') || now=0
+    [[ "$now" =~ ^[0-9]+$ ]] || now=0
+    if (( now > have )); then
+        while IFS= read -r id; do
+            [[ -n "$id" ]] && _EVENT_SEEN[$id]=1
+        done < <(tail -n +$((have + 1)) "$f" 2>/dev/null | jq -r '.id // empty' 2>/dev/null || true)
+    fi
+    _EVENT_PARTITION_LINES[$f]=$now
+    return 0
+}
+
+# Advisory lock on a partition. `mkdir` is atomic on POSIX, which `flock` is not
+# universally available to be — this runs under launchd on macOS too.
+#
+# Fail-soft after ~10s: proceed WITHOUT the lock rather than block. Appending a
+# possible duplicate is strictly better than dropping an observation, and the
+# log is append-only with readers told to tolerate duplicate ids.
+_event_lock() {
+    local lock="$1.lock" waited=0
+    while ! mkdir "$lock" 2>/dev/null; do
+        # Reclaim a lock left behind by a killed run instead of deadlocking.
+        if [[ -n "$(find "$lock" -maxdepth 0 -mmin +2 2>/dev/null)" ]]; then
+            rmdir "$lock" 2>/dev/null || true
+            continue
+        fi
+        sleep 0.2
+        waited=$((waited + 1))
+        (( waited > 50 )) && return 1
+    done
+    return 0
+}
+
+_event_unlock() { rmdir "$1.lock" 2>/dev/null || true; }
 
 # _emit_event <id> <iso_ts> <source> <tier> [payload_json]
 #
@@ -328,12 +366,10 @@ _event_load_partition() {
 #
 # Returns 0 if written, 1 if already present (a no-op re-run) or on bad input.
 #
-# KNOWN LIMITATION: load/check/append is not locked. Two overlapping runs on the
-# same host can each see an id as absent and both append it; later runs then
-# suppress further copies but cannot remove the pair. Sequential runs converge,
-# which is what the nightly cron does — but a manual backfill started while the
-# cron is running can leave duplicate ids behind. Read the log tolerating
-# duplicate ids rather than assuming uniqueness.
+# The check-and-append is serialized by a lock (see _event_lock), so overlapping
+# runs on the same host converge. The lock is advisory and gives up after ~10s,
+# preferring a possible duplicate over a dropped observation, so readers should
+# still tolerate a repeated id rather than assume uniqueness.
 _emit_event() {
     local id="$1" ts="$2" src="$3" tier="$4"
     local payload="${5:-}"
@@ -353,6 +389,21 @@ _emit_event() {
     [[ -n "${_EVENT_SEEN[$id]:-}" ]] && return 1
 
     mkdir -p "${f:h}"
+
+    # Serialize the check-and-append. Without this, two overlapping runs on the
+    # same host (a manual backfill racing the 23:00 cron, say) each load the
+    # partition, both see the id as absent, and both append it — permanently,
+    # since later runs suppress copies but cannot remove one.
+    local locked=0 rc=0
+    _event_lock "$f" && locked=1
+    # Re-check under the lock: the id may have been appended by the other writer
+    # between our load and now.
+    _event_refresh_partition "$f"
+    if [[ -n "${_EVENT_SEEN[$id]:-}" ]]; then
+        (( locked )) && _event_unlock "$f"
+        return 1
+    fi
+
     jq -cn \
         --arg id "$id" \
         --arg ts "$ts" \
@@ -363,10 +414,14 @@ _emit_event() {
         --argjson payload "$payload" \
         '{id:$id, ts:$ts, local_date:$local_date, host:$host,
           source:$source, tier:$tier, payload:$payload}' \
-        >> "$f" 2>/dev/null || return 1
+        >> "$f" 2>/dev/null || rc=1
 
-    _EVENT_SEEN[$id]=1
-    return 0
+    if (( rc == 0 )); then
+        _EVENT_SEEN[$id]=1
+        _EVENT_PARTITION_LINES[$f]=$(( ${_EVENT_PARTITION_LINES[$f]:-0} + 1 ))
+    fi
+    (( locked )) && _event_unlock "$f"
+    return $rc
 }
 
 # --- Subcommands ---
