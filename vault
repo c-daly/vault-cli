@@ -337,9 +337,11 @@ _event_refresh_partition() {
 # Advisory lock on a partition. `mkdir` is atomic on POSIX, which `flock` is not
 # universally available to be — this runs under launchd on macOS too.
 #
-# Fail-soft after ~10s: proceed WITHOUT the lock rather than block. Appending a
-# possible duplicate is strictly better than dropping an observation, and the
-# log is append-only with readers told to tolerate duplicate ids.
+# The wait deliberately exceeds the staleness window below, so acquisition is
+# effectively guaranteed: a lock held by a live writer is released in
+# milliseconds (it spans one append), and a lock orphaned by a killed run is
+# reclaimed after two minutes. Giving up earlier and appending anyway is what
+# the caller must never do — see _emit_event.
 _event_lock() {
     local lock="$1.lock" waited=0
     while ! mkdir "$lock" 2>/dev/null; do
@@ -350,7 +352,7 @@ _event_lock() {
         fi
         sleep 0.2
         waited=$((waited + 1))
-        (( waited > 50 )) && return 1
+        (( waited > 900 )) && return 1   # ~3min, past the reclaim window
     done
     return 0
 }
@@ -367,9 +369,10 @@ _event_unlock() { rmdir "$1.lock" 2>/dev/null || true; }
 # Returns 0 if written, 1 if already present (a no-op re-run) or on bad input.
 #
 # The check-and-append is serialized by a lock (see _event_lock), so overlapping
-# runs on the same host converge. The lock is advisory and gives up after ~10s,
-# preferring a possible duplicate over a dropped observation, so readers should
-# still tolerate a repeated id rather than assume uniqueness.
+# runs on the same host converge on a single copy of each id. If the lock cannot
+# be taken the event is SKIPPED rather than appended unsynchronized: the log is
+# a derivation and a missed event comes back on the next harvest, while a
+# duplicate in an append-only file does not go away.
 _emit_event() {
     local id="$1" ts="$2" src="$3" tier="$4"
     local payload="${5:-}"
@@ -394,13 +397,21 @@ _emit_event() {
     # same host (a manual backfill racing the 23:00 cron, say) each load the
     # partition, both see the id as absent, and both append it — permanently,
     # since later runs suppress copies but cannot remove one.
-    local locked=0 rc=0
-    _event_lock "$f" && locked=1
+    # Never append unsynchronized. An earlier version proceeded without the lock
+    # once the wait expired, which reopened the very race the lock exists to
+    # close — and a duplicate in an append-only log is permanent, whereas a
+    # skipped event is not: the log is a derivation, recoverable by re-running
+    # harvest against the transcripts and git. Drop is cheap, duplicate is not.
+    if ! _event_lock "$f"; then
+        print -u2 "  ! event log: could not lock ${f:t} after 3min; skipping $id"
+        return 1
+    fi
     # Re-check under the lock: the id may have been appended by the other writer
     # between our load and now.
+    local rc=0
     _event_refresh_partition "$f"
     if [[ -n "${_EVENT_SEEN[$id]:-}" ]]; then
-        (( locked )) && _event_unlock "$f"
+        _event_unlock "$f"
         return 1
     fi
 
@@ -420,7 +431,7 @@ _emit_event() {
         _EVENT_SEEN[$id]=1
         _EVENT_PARTITION_LINES[$f]=$(( ${_EVENT_PARTITION_LINES[$f]:-0} + 1 ))
     fi
-    (( locked )) && _event_unlock "$f"
+    _event_unlock "$f"
     return $rc
 }
 
