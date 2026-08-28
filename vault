@@ -47,6 +47,13 @@ RECAP_END="<!-- /auto-recap -->"
 # transcript out of the harvested tree — but it moves the credentials with it,
 # and the narrator then fails with "Not logged in". Hence cwd + skip.
 NARRATE_CWD="${VAULT_NARRATE_CWD:-${TMPDIR:-/tmp}/vault-cli-narrate}"
+# Normalize BEFORE deriving the key. A trailing slash in TMPDIR (`/tmp/` gives
+# `/tmp//vault-cli-narrate`), a relative VAULT_NARRATE_CWD, or a `..` segment
+# would each yield a key that never matches the cwd Claude actually records —
+# and the skip below would then silently stop working, which is the failure
+# mode this whole mechanism exists to prevent. `:a` absolutizes and collapses
+# without resolving symlinks, matching `cd`, which keeps the logical path.
+NARRATE_CWD="${NARRATE_CWD:a}"
 # Claude Code names a project directory after the cwd with `/` replaced by `-`.
 NARRATE_PROJECT_DIR="${NARRATE_CWD//\//-}"
 
@@ -1429,6 +1436,10 @@ _collect_claude_sessions() {
     done
 
     for project_dir in "${project_dirs[@]}"; do
+        # The narrator's own `claude -p` transcripts are not the user's work.
+        # cmd_harvest skips them too; skipping only there would still let them
+        # be listed and summarized as sessions in the recap markdown.
+        [[ "${project_dir:t}" == "$NARRATE_PROJECT_DIR" ]] && continue
         [[ -d "$project_dir" ]] || continue
         project_name=$(basename "$project_dir")
         proj_sessions=0 proj_output=""
@@ -2014,6 +2025,9 @@ cmd_backfill() {
         session_project_dirs+=("$claude_root"/*(N/))
     done < <(_claude_roots)
     for project_dir in "${session_project_dirs[@]}"; do
+        # Narrator transcripts must not contribute dates to backfill either —
+        # they are all stamped whenever narration last ran, not when work happened.
+        [[ "${project_dir:t}" == "$NARRATE_PROJECT_DIR" ]] && continue
         for session_file in "$project_dir"/*.jsonl(N); do
             [[ -f "$session_file" ]] || continue
             ts=$(head -1 "$session_file" | jq -r '.timestamp // empty' 2>/dev/null) || true
