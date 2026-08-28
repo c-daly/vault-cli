@@ -127,12 +127,26 @@ _journal_path() {
 # timestamps, so strip the fractional part + Z, parse via strptime as
 # UTC broken-down time, convert to epoch via mktime, then format in
 # local time via strflocaltime.
+#
+# Handles both forms that reach it: Claude timestamps end in `Z`, but git's
+# `%aI` emits an explicit offset (`2026-08-29T01:00:00+02:00`). The original
+# expression only stripped `Z`, so an offset timestamp failed to parse and the
+# caller silently fell back to the first ten characters — the *author's* local
+# date. A commit made at 01:00+02:00 then filed under the 29th while the recap
+# collector, working in local time, listed it under the 28th.
 _iso_to_local_date() {
     jq -nr --arg ts "$1" '
-        $ts
-        | sub("\\..*Z$|Z$"; "")
-        | strptime("%Y-%m-%dT%H:%M:%S")
-        | mktime
+        ($ts | sub("\\.[0-9]+"; ""))
+        | if test("Z$") then
+              (sub("Z$"; "") | strptime("%Y-%m-%dT%H:%M:%S") | mktime)
+          elif test("[+-][0-9]{2}:[0-9]{2}$") then
+              (capture("(?<base>.*)(?<sign>[+-])(?<oh>[0-9]{2}):(?<om>[0-9]{2})$")
+               | (.base | strptime("%Y-%m-%dT%H:%M:%S") | mktime)
+                 - ((if .sign == "+" then 1 else -1 end)
+                    * ((.oh | tonumber) * 3600 + (.om | tonumber) * 60)))
+          else
+              (strptime("%Y-%m-%dT%H:%M:%S") | mktime)
+          end
         | strflocaltime("%Y-%m-%d")
     ' 2>/dev/null
 }
@@ -192,6 +206,16 @@ _canonical_path() {
         p="/mnt/${drive:l}/${p:3}"
     fi
     p="${p//\\//}"
+    # Collapse duplicate slashes and `.`/`..` segments so `/mnt/c/X//` and
+    # `/mnt/c/./X` key the same as `/mnt/c/X`. `:a` is lexical — it does not
+    # touch the filesystem and does not resolve symlinks, which matters because
+    # `cd` keeps the logical path and the recorded cwd is the logical one.
+    #
+    # A RELATIVE path is deliberately left alone. `:a` would resolve it against
+    # this process's cwd, which is wherever `vault` happens to be run from, not
+    # the cwd of the session that recorded it — that would invent a confidently
+    # wrong absolute path. Better an un-joined relative key than a false join.
+    [[ "$p" == /* ]] && p="${p:a}"
     [[ "$p" == "/" ]] || p="${p%/}"
     printf '%s' "$p"
 }
@@ -252,6 +276,13 @@ _event_load_partition() {
 # in as observed.
 #
 # Returns 0 if written, 1 if already present (a no-op re-run) or on bad input.
+#
+# KNOWN LIMITATION: load/check/append is not locked. Two overlapping runs on the
+# same host can each see an id as absent and both append it; later runs then
+# suppress further copies but cannot remove the pair. Sequential runs converge,
+# which is what the nightly cron does — but a manual backfill started while the
+# cron is running can leave duplicate ids behind. Read the log tolerating
+# duplicate ids rather than assuming uniqueness.
 _emit_event() {
     local id="$1" ts="$2" src="$3" tier="$4"
     local payload="${5:-}"
@@ -754,17 +785,23 @@ _harvest_one_jsonl() {
     # events. (cwd, branch) is the thread key the reconstruction query joins
     # on, so it is captured here where the transcript already yields it rather
     # than reconstructed by interval-joining after the fact.
+    # Fields are separated by US (0x1f), NOT tab. `read` splits on IFS, and a
+    # tab is IFS *whitespace*, so zsh collapses runs of it and strips leading
+    # ones: a row whose first field is empty (a record with no timestamp, which
+    # the extraction below explicitly admits) would shift every later field left
+    # by one. US is not whitespace, so empty fields survive intact — and a path
+    # containing a literal tab can no longer split a field either.
     local segments_tsv
     segments_tsv=$(jq -r '
         select(.cwd or .gitBranch)
-        | "\(.timestamp // "")\t\(.cwd // "?")\t\(.gitBranch // "?")"
-    ' "$jsonl" 2>/dev/null | awk -F'\t' '
+        | "\(.timestamp // "")\u001f\(.cwd // "?")\u001f\(.gitBranch // "?")"
+    ' "$jsonl" 2>/dev/null | awk -F$'\037' '
         BEGIN { key=""; start=""; cwd=""; branch=""; last_ts="" }
         {
             newkey = $2 "|" $3
             if (newkey != key) {
                 if (key != "") {
-                    printf "%s\t%s\t%s\t%s\n", start, last_ts, cwd, branch
+                    printf "%s\037%s\037%s\037%s\n", start, last_ts, cwd, branch
                 }
                 key = newkey; start = $1; cwd = $2; branch = $3
             }
@@ -772,13 +809,13 @@ _harvest_one_jsonl() {
         }
         END {
             if (key != "") {
-                printf "%s\t%s\t%s\t%s\n", start, last_ts, cwd, branch
+                printf "%s\037%s\037%s\037%s\n", start, last_ts, cwd, branch
             }
         }
     ')
 
     local segments
-    segments=$(printf '%s' "$segments_tsv" | awk -F'\t' '
+    segments=$(printf '%s' "$segments_tsv" | awk -F$'\037' '
         NF { printf "- %s → %s  %s @%s\n", $1, $2, $3, $4 }
     ')
 
@@ -849,11 +886,17 @@ _harvest_one_jsonl() {
             or (.name | endswith("__edit_file"))
             or (.name | endswith("__write_file"))
           ))
-        | select(.input.file_path != null)
-        | "\($ts // "")\t\(.input.file_path)"
+        | (.input.file_path // empty) as $p
+        | "\($ts // "")\u001f\($p)"
     ' "$jsonl" 2>/dev/null)
-    files_raw=$(printf '%s' "$files_ts" | awk -F'\t' 'NF > 1 { print $2 }' | sort -u)
-    files=$(printf '%s' "$files_raw" | sed -e '/^$/d' -e 's/^/- /')
+    # `// empty` above, not `!= null`: jq's `//` also drops `false`, and the
+    # pre-event code used `//`. `!= null` would have rendered a literal
+    # `- false` into the note. It keeps an empty-string path, and so must the
+    # markdown — hence no `/^$/d` here, which would have dropped the `- ` line
+    # the old pipeline emitted. Both are degenerate inputs; the point is that
+    # the rendered note stays byte-for-byte what it was.
+    files_raw=$(printf '%s' "$files_ts" | awk -F$'\037' 'NF > 1 { print $2 }' | sort -u)
+    files=$(printf '%s' "$files_raw" | sed 's/^/- /')
 
     # Commits / PRs from Bash commands
     local commits
@@ -900,8 +943,16 @@ _harvest_one_jsonl() {
              + (if $parent_session == "" then {} else {parent_session:$parent_session} end)
              + (if $agent_id == "" then {} else {agent_id:$agent_id} end)
             ' 2>/dev/null) || ev_payload=""
+        # The id carries last_ts, not just the session id. A session harvested
+        # while it is still running would otherwise freeze at its first
+        # observation: dedup is by id, so the later harvest that sees a longer
+        # transcript is discarded as a duplicate and last_ts, duration,
+        # message_count and user_turns stay wrong forever, even though the
+        # markdown note updates. Including the end state means each distinct
+        # end state is appended once. Read the log by taking the newest event
+        # per payload.session_id.
         if [[ -n "$ev_payload" ]]; then
-            _emit_event "session:$sid" "$first_ts" "claude-session" "observed" "$ev_payload" || true
+            _emit_event "session:$sid:$last_ts" "$first_ts" "claude-session" "observed" "$ev_payload" || true
         fi
 
         # One event per (cwd,branch) work segment. Interval-shaped on purpose:
@@ -909,7 +960,7 @@ _harvest_one_jsonl() {
         # different numbers derived from these same intervals, and collapsing
         # them at capture would force a false choice about concurrency.
         local seg_start seg_end seg_cwd seg_branch seg_payload seg_thread
-        while IFS=$'\t' read -r seg_start seg_end seg_cwd seg_branch; do
+        while IFS=$'\037' read -r seg_start seg_end seg_cwd seg_branch; do
             [[ -n "$seg_start" ]] || continue
             # `thread` is the canonical repo root, so it joins across path forms
             # and across sources (a commit event on the same repo carries the
@@ -926,7 +977,10 @@ _harvest_one_jsonl() {
                   cwd:$cwd, branch:$branch,
                   thread:$thread, thread_branch:($thread + "@" + $branch)}
                 ' 2>/dev/null) || continue
-            _emit_event "segment:$sid:$seg_start" "$seg_start" \
+            # End included for the same reason as the session id: a segment that
+            # is still being extended must be able to supersede its own earlier
+            # observation. Take the newest per (session_id, start).
+            _emit_event "segment:$sid:$seg_start:$seg_end" "$seg_start" \
                 "claude-session" "observed" "$seg_payload" || true
         done <<< "$segments_tsv"
 
@@ -938,7 +992,7 @@ _harvest_one_jsonl() {
         # produced. The id is (session, path), so a file edited repeatedly keeps
         # its FIRST write as its produced-at rather than accumulating events.
         local art_ts art_path art_payload art_canon
-        while IFS=$'\t' read -r art_ts art_path; do
+        while IFS=$'\037' read -r art_ts art_path; do
             [[ -n "$art_path" ]] || continue
             [[ -n "$art_ts" ]] || art_ts="$last_ts"
             # Same file written from Windows and from WSL must be one artifact,
@@ -1410,8 +1464,9 @@ _collect_git_activity() {
         # call rather than reworking the one above, so the markdown stays
         # byte-identical. %aI gives ISO-8601 with an explicit UTC offset, and
         # the SHA is the natural content-derived id, so re-running backfill
-        # re-emits nothing. This function runs inside a command substitution,
-        # so it must stay silent on stdout — events go to a file, not here.
+        # re-emits nothing. This function's stdout is redirected into the
+        # activity file that becomes the note body, so nothing added here may
+        # print to stdout — events are appended to their own file instead.
         if [[ -z "${VAULT_NO_EVENTS:-}" ]]; then
             # NOTE: this is the branch checked out *now*, not the branch the
             # commit was made on — git cannot recover historical branch
