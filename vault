@@ -175,6 +175,51 @@ EVENTS_DIR="${VAULT_EVENTS_DIR:-$VAULT_DIR/events}"
 typeset -gA _EVENT_SEEN=()
 typeset -gA _EVENT_PARTITION_LOADED=()
 
+# Canonicalize a path so the SAME directory, reported by different clients,
+# collapses to one string. A session started from PowerShell reports
+# `C:\Users\cddal\HexWars`, some tools report `C:/Users/cddal/HexWars`, and the
+# repo scan sees those very same files through the WSL mount as
+# `/mnt/c/Users/cddal/HexWars`. Left alone, one repo's work splits across three
+# thread keys and the session that did the work never joins the commits it
+# produced — measured on HexWars, which had 465 commit events on one side of
+# the split and every one of its sessions on the other.
+_canonical_path() {
+    local p="$1"
+    [[ -n "$p" ]] || return 0
+    # Drive-letter forms -> the WSL mount point for that drive.
+    if [[ "$p" == [A-Za-z]:[\\/]* ]]; then
+        local drive="${p:0:1}"
+        p="/mnt/${drive:l}/${p:3}"
+    fi
+    p="${p//\\//}"
+    [[ "$p" == "/" ]] || p="${p%/}"
+    printf '%s' "$p"
+}
+
+typeset -gA _THREAD_ROOT_CACHE=()
+
+# Thread key for a working directory: the repo root where one is discoverable,
+# otherwise the canonical path. Resolving to the root is what lets a session run
+# from a subdirectory (`HexWars/Assets/HexWars/Presentation`) join that repo's
+# commits. Fail-soft by design — a path that has since moved or is unreachable
+# keeps its canonical form rather than being dropped.
+_thread_key() {
+    local p
+    p="$(_canonical_path "$1")"
+    [[ -n "$p" ]] || return 0
+    if [[ -n "${_THREAD_ROOT_CACHE[$p]:-}" ]]; then
+        printf '%s' "${_THREAD_ROOT_CACHE[$p]}"
+        return 0
+    fi
+    local root=""
+    if [[ -d "$p" ]]; then
+        root=$(git -C "$p" rev-parse --show-toplevel 2>/dev/null) || root=""
+    fi
+    [[ -n "$root" ]] || root="$p"
+    _THREAD_ROOT_CACHE[$p]="$root"
+    printf '%s' "$root"
+}
+
 # Month partition for a given LOCAL date. Monthly keeps a single file browsable
 # while staying coarse enough that appends stay cheap.
 _event_file() {
@@ -863,15 +908,23 @@ _harvest_one_jsonl() {
         # elapsed (union), effort (sum) and attention (AFK-filtered) are three
         # different numbers derived from these same intervals, and collapsing
         # them at capture would force a false choice about concurrency.
-        local seg_start seg_end seg_cwd seg_branch seg_payload
+        local seg_start seg_end seg_cwd seg_branch seg_payload seg_thread
         while IFS=$'\t' read -r seg_start seg_end seg_cwd seg_branch; do
             [[ -n "$seg_start" ]] || continue
+            # `thread` is the canonical repo root, so it joins across path forms
+            # and across sources (a commit event on the same repo carries the
+            # same value). `thread_branch` keeps the finer repo+branch key the
+            # design asks for, and the raw `cwd` is preserved either way —
+            # canonicalizing the key must not destroy what was observed.
+            seg_thread="$(_thread_key "$seg_cwd")"
             seg_payload=$(jq -cn \
                 --arg session_id "$sid" \
                 --arg start "$seg_start" --arg end "$seg_end" \
                 --arg cwd "$seg_cwd" --arg branch "$seg_branch" \
+                --arg thread "$seg_thread" \
                 '{session_id:$session_id, start:$start, end:$end,
-                  cwd:$cwd, branch:$branch, thread:($cwd + "@" + $branch)}
+                  cwd:$cwd, branch:$branch,
+                  thread:$thread, thread_branch:($thread + "@" + $branch)}
                 ' 2>/dev/null) || continue
             _emit_event "segment:$sid:$seg_start" "$seg_start" \
                 "claude-session" "observed" "$seg_payload" || true
@@ -884,13 +937,18 @@ _harvest_one_jsonl() {
         # running past midnight files each artifact on the day it was actually
         # produced. The id is (session, path), so a file edited repeatedly keeps
         # its FIRST write as its produced-at rather than accumulating events.
-        local art_ts art_path art_payload
+        local art_ts art_path art_payload art_canon
         while IFS=$'\t' read -r art_ts art_path; do
             [[ -n "$art_path" ]] || continue
             [[ -n "$art_ts" ]] || art_ts="$last_ts"
+            # Same file written from Windows and from WSL must be one artifact,
+            # so carry the canonical form alongside the path as observed.
+            art_canon="$(_canonical_path "$art_path")"
             art_payload=$(jq -cn \
                 --arg path "$art_path" --arg session_id "$sid" --arg written_at "$art_ts" \
-                '{path:$path, produced_by:$session_id, written_at:$written_at}' 2>/dev/null) || continue
+                --arg canonical_path "$art_canon" \
+                '{path:$path, canonical_path:$canonical_path,
+                  produced_by:$session_id, written_at:$written_at}' 2>/dev/null) || continue
             _emit_event "artifact:$sid:$art_path" "$art_ts" \
                 "claude-session" "observed" "$art_payload" || true
         done <<< "$files_ts"
@@ -1300,7 +1358,7 @@ _collect_git_activity() {
     # has bitten this function before (see "move all local declarations out of
     # loops" in the history).
     local repo_name log count
-    local c_sha c_ts c_subject c_payload c_head_branch
+    local c_sha c_ts c_subject c_payload c_head_branch c_thread
 
     # Collect all git repos (up to 3 levels deep) from each search path
     local -a all_repos=()
@@ -1360,6 +1418,10 @@ _collect_git_activity() {
             # membership for a backfilled commit. Named accordingly so a query
             # never mistakes it for ground truth; `repo` is the reliable key.
             c_head_branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+            # Canonical repo root, matching what a session segment in this repo
+            # emits as its `thread` — this is the join between a conversation
+            # and the commits it produced.
+            c_thread="$(_thread_key "$repo")"
             while IFS=$'\t' read -r c_sha c_ts c_subject; do
                 [[ -n "$c_sha" && -n "$c_ts" ]] || continue
                 case "$c_subject" in
@@ -1371,8 +1433,9 @@ _collect_git_activity() {
                     --arg path "$repo" \
                     --arg subject "$c_subject" \
                     --arg head_branch "$c_head_branch" \
+                    --arg thread "$c_thread" \
                     '{sha:$sha, repo:$repo, path:$path, subject:$subject,
-                      head_branch:$head_branch, thread:$path}' 2>/dev/null) || continue
+                      head_branch:$head_branch, thread:$thread}' 2>/dev/null) || continue
                 _emit_event "commit:$c_sha" "$c_ts" "git" "observed" "$c_payload" || true
             done < <(git -C "$repo" log \
                 --after="${target_date}T00:00:00" \
