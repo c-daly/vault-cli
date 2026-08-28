@@ -1481,13 +1481,20 @@ _collect_claude_sessions() {
                 | select(test("^<(command|local-command)-") | not)
                 | gsub("\n"; " ")
             ' "$session_file" 2>/dev/null) || all_prompts=""
-            first_prompt=$(printf '%s\n' "$all_prompts" | head -1)
+            # Take the first line via parameter expansion, NOT `| head -1`:
+            # under `set -o pipefail`, head exits after one line, printf takes
+            # SIGPIPE, the pipeline returns 141, and the unguarded assignment
+            # aborts the whole recap on any sufficiently long prompt corpus.
+            first_prompt="${all_prompts%%$'\n'*}"
             session_summary=$(_llm_summarize "In 2-4 sentences, describe specifically what this work session did: the concrete topics, decisions, and outcomes, and how it evolved from start to finish. Be specific, not high-level. Do not state any date. No preamble; don't say 'the user'." "$(printf '%s\n' "$all_prompts" | _sample_lines 120)")
 
             preview=""
             if [[ -n "$session_summary" ]]; then
                 preview="$session_summary"
-            elif [[ -n "$ai_title" ]]; then
+            elif [[ "${NARRATE:-1}" == "1" && -n "$ai_title" ]]; then
+                # `ai-title` is itself model-generated session metadata, so it
+                # is gated on NARRATE too. With narration off the contract is a
+                # verbatim fall back to the first user prompt.
                 preview="$ai_title"
             elif [[ -n "$first_prompt" ]]; then
                 preview="${first_prompt:0:100}"
