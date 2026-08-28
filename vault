@@ -1694,11 +1694,15 @@ cmd_recap() {
             # recoverable by inspection — the old block body and the user's own
             # text are indistinguishable — so keep a backup instead of guessing.
             local legacy_unterminated=0
+            # Check EVERY same-host block, not just the first. A file can carry
+            # leftover duplicates, and it is a later one being unterminated that
+            # is dangerous: the first block terminating cleanly would otherwise
+            # let the guard pass while the splice below still ran to EOF.
             awk -v host="$host" -v recap_end="$RECAP_END" '
-                BEGIN { seen = 0; found = 0; sub_pat = "^## Auto-Recap \\(" host "\\)$" }
-                !seen && $0 ~ sub_pat { seen = 1; next }
-                seen && ($0 == recap_end || /^---$/) { found = 1; exit }
-                END { exit (seen && !found) ? 1 : 0 }
+                BEGIN { inblock = 0; bad = 0; sub_pat = "^## Auto-Recap \\(" host "\\)$" }
+                $0 ~ sub_pat { if (inblock) bad = 1; inblock = 1; next }
+                inblock && ($0 == recap_end || /^---$/) { inblock = 0; next }
+                END { exit (bad || inblock) ? 1 : 0 }
             ' "$recap_file" || legacy_unterminated=1
 
             if (( legacy_unterminated )); then
@@ -1708,7 +1712,7 @@ cmd_recap() {
             fi
 
             awk -v host="$host" -v block_file="$block_tmp" -v recap_end="$RECAP_END" '
-                BEGIN { state = 0; sub_pat = "^## Auto-Recap \\(" host "\\)$" }
+                BEGIN { state = 0; held = ""; sub_pat = "^## Auto-Recap \\(" host "\\)$" }
                 state == 0 {
                     if ($0 ~ sub_pat) {
                         while ((getline line < block_file) > 0) print line
@@ -1720,11 +1724,12 @@ cmd_recap() {
                     next
                 }
                 state == 1 {
-                    if ($0 == recap_end) { state = 2; print; next }
+                    if ($0 == recap_end) { state = 2; print; held = ""; next }
                     # Legacy block terminated by a bare `---`: emit the sentinel
                     # as we pass, migrating the file to the unambiguous marker.
-                    if (/^---$/) { print recap_end; print ""; state = 2; print; next }
-                    next   # skip lines from the old (first) block
+                    if (/^---$/) { print recap_end; print ""; state = 2; print; held = ""; next }
+                    held = held $0 "\n"   # hold, do not drop — see END
+                    next
                 }
                 state == 2 {
                     # A further same-host block: a leftover dupe. Drop it and
@@ -1734,8 +1739,18 @@ cmd_recap() {
                     next
                 }
                 state == 3 {
-                    if ($0 == recap_end || /^---$/) { state = 2; next }
-                    next   # skip the dupe block body
+                    if ($0 == recap_end || /^---$/) { state = 2; held = ""; next }
+                    held = held $0 "\n"
+                    next
+                }
+                END {
+                    # Ending inside a block means it had no terminator, so the
+                    # skip ran to EOF. Everything held back from that point is
+                    # indistinguishable from user-authored text, so emit it
+                    # rather than deleting it silently. Keeping a stale
+                    # duplicate block is a cosmetic cost; losing the user'"'"'s own
+                    # notes is not recoverable.
+                    if (state == 1 || state == 3) printf "%s", held
                 }
             ' "$recap_file" > "$spliced_tmp"
 
