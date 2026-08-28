@@ -354,13 +354,31 @@ _event_lock() {
     # This matters because pauses are ordinary here — WSL2 suspends the whole VM
     # and laptops sleep — and evicting a merely-slow holder would put two writers
     # in the critical section, which is the duplicate the lock exists to prevent.
-    while ! ln -s "$$" "$lock" 2>/dev/null; do
+    while true; do
+        # A real directory here is a lock from the earlier mkdir-based scheme,
+        # which recorded its owner in `lock/pid`. It must be resolved BEFORE the
+        # `ln -s` attempt: `ln -s target dir` does not fail, it creates the link
+        # INSIDE the directory and reports success, which would hand out a lock
+        # nobody holds while the legacy holder is still writing.
+        if [[ -d "$lock" && ! -L "$lock" ]]; then
+            holder=$(cat "$lock/pid" 2>/dev/null) || holder=""
+            if [[ -z "$holder" ]] || ! kill -0 "$holder" 2>/dev/null; then
+                rm -f "$lock/pid" 2>/dev/null || true
+                rmdir "$lock" 2>/dev/null || true
+            else
+                sleep 0.2
+            fi
+            waited=$((waited + 1))
+            (( waited > 900 )) && return 1
+            continue
+        fi
+
+        ln -s "$$" "$lock" 2>/dev/null && return 0
+
         holder=$(readlink "$lock" 2>/dev/null) || holder=""
         if [[ -z "$holder" ]] || ! kill -0 "$holder" 2>/dev/null; then
-            # Holder is gone, the link vanished under us, or this is a directory
-            # left by the earlier mkdir-based lock. Clear it and retry.
-            rm -f "$lock" "$lock/pid" 2>/dev/null || true
-            rmdir "$lock" 2>/dev/null || true
+            # Holder is gone, or the link vanished under us. Clear and retry.
+            rm -f "$lock" 2>/dev/null || true
         else
             sleep 0.2
         fi
@@ -368,7 +386,6 @@ _event_lock() {
         waited=$((waited + 1))
         (( waited > 900 )) && return 1   # ~3min; caller skips rather than races
     done
-    return 0
 }
 
 _event_unlock() { rm -f "$1.lock" 2>/dev/null || true; }
