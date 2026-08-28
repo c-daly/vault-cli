@@ -344,36 +344,34 @@ _event_refresh_partition() {
 # the caller must never do — see _emit_event.
 _event_lock() {
     local lock="$1.lock" waited=0 holder=""
-    while ! mkdir "$lock" 2>/dev/null; do
-        # Reclaim only from a holder that is GONE, never merely an old one.
-        # Age is not evidence of death: a writer suspended by the OS still holds
-        # the lock legitimately, and this runs under WSL2, which pauses the whole
-        # VM, and on laptops that sleep. Evicting a live holder puts two writers
-        # in the critical section — precisely the duplicate the lock prevents.
-        holder=$(cat "$lock/pid" 2>/dev/null) || holder=""
-        if [[ -n "$holder" ]] && ! kill -0 "$holder" 2>/dev/null; then
-            rm -f "$lock/pid" 2>/dev/null || true
+    # `ln -s` is atomic AND records the owner in the SAME operation, so unlike
+    # `mkdir` followed by a separate pid write there is never an instant where
+    # the lock exists with no known holder. That gap was the last place an
+    # age-based reclaim could evict a live writer, and with it gone the age
+    # heuristic goes too: ownership is decided purely by whether the recorded
+    # process is still alive.
+    #
+    # This matters because pauses are ordinary here — WSL2 suspends the whole VM
+    # and laptops sleep — and evicting a merely-slow holder would put two writers
+    # in the critical section, which is the duplicate the lock exists to prevent.
+    while ! ln -s "$$" "$lock" 2>/dev/null; do
+        holder=$(readlink "$lock" 2>/dev/null) || holder=""
+        if [[ -z "$holder" ]] || ! kill -0 "$holder" 2>/dev/null; then
+            # Holder is gone, the link vanished under us, or this is a directory
+            # left by the earlier mkdir-based lock. Clear it and retry.
+            rm -f "$lock" "$lock/pid" 2>/dev/null || true
             rmdir "$lock" 2>/dev/null || true
-            continue
+        else
+            sleep 0.2
         fi
-        # No pid recorded: the holder is mid-acquire, between the mkdir and the
-        # write. Only reclaim if it never lands, which means it died in that gap.
-        if [[ -z "$holder" && -n "$(find "$lock" -maxdepth 0 -mmin +2 2>/dev/null)" ]]; then
-            rmdir "$lock" 2>/dev/null || true
-            continue
-        fi
-        sleep 0.2
+        # Counted on both paths so a lock that can never be cleared still exits.
         waited=$((waited + 1))
         (( waited > 900 )) && return 1   # ~3min; caller skips rather than races
     done
-    print -r -- "$$" > "$lock/pid" 2>/dev/null || true
     return 0
 }
 
-_event_unlock() {
-    rm -f "$1.lock/pid" 2>/dev/null || true
-    rmdir "$1.lock" 2>/dev/null || true
-}
+_event_unlock() { rm -f "$1.lock" 2>/dev/null || true; }
 
 # _emit_event <id> <iso_ts> <source> <tier> [payload_json]
 #
