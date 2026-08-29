@@ -1050,7 +1050,7 @@ _harvest_one_jsonl() {
     # reads as an indented code block. Turns 1-9 rendered as preformatted text
     # while 10+ rendered as a list, in the same section.
     local user_turns
-    user_turns=$(jq -r --arg noise "$NOISE_PAT" '
+    user_turns=$(jq -j --arg noise "$NOISE_PAT" '
         select(.type == "user")
         | .message.content
         | if type == "string" then .
@@ -1062,13 +1062,27 @@ _harvest_one_jsonl() {
           end
         | select(length > 0)
         | select(test($noise) | not)
-        | gsub("\n"; " ¶ ")
         # Escape `<` so tag-shaped text stays visible. Markdown treats a raw
         # `<bash-input>` as HTML and renders nothing at all, which silently
         # deletes real content from the page — 1838 turn lines carried
         # angle-bracket text. `&lt;` displays as `<`.
         | gsub("<"; "&lt;")
-    ' "$jsonl" 2>/dev/null | awk '{ printf "%d. %s\n", NR, $0 }')
+        # Records separated by US, newlines KEPT. Collapsing a turn to one line
+        # with a `¶` made a long paste an unreadable wall of several thousand
+        # characters; the structure the user typed is worth preserving.
+        | ., "\u001f"
+    ' "$jsonl" 2>/dev/null | awk -v RS=$'\037' '
+        { sub(/\n+$/, "") }
+        /[^[:space:]]/ {
+            n++
+            m = split($0, L, "\n")
+            printf "%d. %s\n", n, L[1]
+            # Continuation lines indent to the item content column, so the turn
+            # stays one list item instead of breaking into separate blocks.
+            pad = substr("          ", 1, length(n) + 2)
+            for (k = 2; k <= m; k++) printf "%s%s\n", pad, L[k]
+        }
+    ')
 
     # Stub detection: count user turns that look like genuine typed input
     # (not the `<command-name>/exit</command-name>` and
@@ -1172,7 +1186,12 @@ _harvest_one_jsonl() {
     files_raw=$(printf '%s' "$files_ts" | awk -F$'\037' 'NF > 1 { print $2 }' | sort -u)
     files=$(printf '%s' "$files_raw" | sed 's/^/- /')
 
-    # Commits / PRs from Bash commands
+    # Git and PR commands run during the session.
+    #
+    # These are the shell commands themselves, not commits — the section used to
+    # be headed "Commits / PRs", which promised something it never delivered and
+    # rendered raw shell as prose. The actual commit record lives in the event
+    # log and the recap's git section; what belongs here is what was run.
     local commits
     commits=$(jq -r '
         select(.type == "assistant")
@@ -1181,8 +1200,12 @@ _harvest_one_jsonl() {
         | select(.type == "tool_use" and (.name == "Bash" or (.name | endswith("__bash"))))
         | .input.command // empty
         | select(test("git commit|gh pr|gh issue"; "i"))
-        | gsub("\n"; " ↵ ")
-    ' "$jsonl" 2>/dev/null | sed 's/^/- /')
+        # Newlines kept. Collapsing them to `↵` produced single lines up to
+        # 45,000 characters — a heredoc rendered as one unreadable strip. Inside
+        # a fence the real structure costs nothing. The extra newline separates
+        # one command from the next.
+        | . + "\n"
+    ' "$jsonl" 2>/dev/null)
 
     # ===== Event log =====
     #
@@ -1348,8 +1371,10 @@ _harvest_one_jsonl() {
         if [[ -n "$files" ]]; then printf '%s\n' "$files"; else printf '_(none)_\n'; fi
         printf '\n'
 
-        printf '## Commits / PRs\n'
-        if [[ -n "$commits" ]]; then printf '%s\n' "$commits"; else printf '_(none)_\n'; fi
+        printf '## Git & PR commands\n'
+        # Fenced, not bulleted: these are shell, and a fence renders them as
+        # such without markdown mangling quotes, pipes or angle brackets.
+        if [[ -n "$commits" ]]; then printf '```sh\n%s\n```\n' "$commits"; else printf '_(none)_\n'; fi
         printf '\n'
 
         # No `## Parent session` branch: subagents return before this point and
