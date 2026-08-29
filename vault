@@ -1716,6 +1716,12 @@ cmd_recap() {
             awk -v host="$host" -v recap_end="$RECAP_END" '
                 BEGIN { inblock = 0; found = 0; sub_pat = "^## Auto-Recap \\(" host "\\)$" }
                 !inblock && $0 ~ sub_pat { inblock = 1; next }
+                # ANY later recap header — this host or another machine’s —
+                # means the first block never terminated. Stop scanning there:
+                # accepting a subsequent block’s sentinel as this block’s
+                # boundary would let the splice discard everything between them,
+                # taking the other machine’s recap and any user notes with it.
+                inblock && /^## Auto-Recap \(/ { exit }
                 inblock && $0 == recap_end { found = 1; exit }
                 END { exit found ? 0 : 1 }
             ' "$recap_file" || legacy_block=1

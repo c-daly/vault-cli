@@ -367,6 +367,54 @@ else
     fi
 fi
 
+# === CHECK 9: a later block's sentinel is not this block's boundary =========
+# An unterminated legacy block followed by a sentinel-terminated block from
+# another machine. Accepting the later sentinel as the first block's end would
+# make the splice discard everything between them — the other machine's recap
+# and any user notes with it.
+rm -f "$RECAP_FILE" "${RECAP_FILE}.pre-recap.bak"
+cat > "$RECAP_FILE" <<TWOHOST
+---
+created: $TARGET_DATE
+type: daily-recap
+---
+
+# two-host fixture
+
+## Auto-Recap ($HOST_NAME)
+_Generated: long ago, never terminated_
+OLD-UNTERMINATED-BODY
+
+## Auto-Recap (otherbox)
+_Generated: elsewhere_
+OTHER-MACHINE-RECAP
+$STUB_END
+
+BETWEEN-HOSTS-USER-NOTE
+TWOHOST
+
+run_recap 1 >/dev/null 2>&1
+
+if [[ ! -f "$RECAP_FILE" ]]; then
+    fail "check 9: recap file vanished"
+else
+    if grep -qF "OTHER-MACHINE-RECAP" "$RECAP_FILE"; then
+        pass "check 9a: another machine's recap survived"
+    else
+        fail "check 9a: another machine's recap was deleted"
+    fi
+    if grep -qF "BETWEEN-HOSTS-USER-NOTE" "$RECAP_FILE"; then
+        pass "check 9b: user note after the other block survived"
+    else
+        fail "check 9b: user note was deleted"
+    fi
+    if grep -qF "## Auto-Recap (otherbox)" "$RECAP_FILE"; then
+        pass "check 9c: the other host's block header is intact"
+    else
+        fail "check 9c: the other host's block header was removed"
+    fi
+fi
+
 # --- Verdict ----------------------------------------------------------------
 print -r -- ""
 if [[ "$fails" -eq 0 ]]; then
