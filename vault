@@ -29,6 +29,26 @@ _claude_roots() {
     done
 }
 
+# What counts as text the user actually typed.
+#
+# Two lists, because the answer differs by purpose. A session transcript carries
+# a lot of machine-authored text in `user` records — slash-command envelopes,
+# skill documents the harness injects, system reminders, continuation
+# preambles. Measured across this vault: 306 of 468 session notes (65%) had NOT
+# ONE genuinely typed message, and were kept anyway because the stub check only
+# knew about `<command-…>`.
+#
+# NOISE is machine text that should never be rendered or counted.
+NOISE_PAT='^(<(command|local-command)-|<system-reminder>|<task-notification>|Base directory for this skill:|Caveat: The messages below|This session is being continued|#[[:space:]]+.*[[:space:]]Skill([[:space:]]|$))'
+#
+# CONTEXT is real but not typed by the user: an interruption they performed, a
+# message another agent sent, the output of a command they ran. Worth showing
+# inside a session that has real turns, but a session containing ONLY these is
+# not a session — it is machinery talking, and gets skipped as a stub.
+#
+# `<bash-input>` is deliberately NOT here: the user typed that command.
+CONTEXT_PAT='^(\[Request interrupted by user|<teammate-message|<bash-stdout|Another Claude session sent a message:)'
+
 # Unambiguous end-of-block marker for `## Auto-Recap (HOST)` sections. An HTML
 # comment renders as nothing in Obsidian and cannot collide with note content
 # the way a bare `---` can (inbox captures are spliced in verbatim, and YAML
@@ -1021,21 +1041,55 @@ _harvest_one_jsonl() {
         NF { printf "- %s → %s  %s @%s\n", $1, $2, $3, $4 }
     ')
 
-    # User turns (real prompts: skip tool_result-bearing user records)
+    # User turns. Drops NOISE outright; keeps CONTEXT, because an interruption
+    # or another agent's message is part of what happened in a session that has
+    # real turns — it just cannot be the ONLY thing in one (see the stub check).
+    #
+    # Numbered at column 0. The previous `nl -w2` + 3-space indent right-aligned
+    # the number, so single-digit turns began with FOUR spaces — which CommonMark
+    # reads as an indented code block. Turns 1-9 rendered as preformatted text
+    # while 10+ rendered as a list, in the same section.
     local user_turns
-    user_turns=$(jq -r '
-        select(.type == "user")
-        | .message.content
-        | if type == "string" then .
-          elif type == "array" then
-            if any(.type == "tool_result") then empty
-            else ([.[] | select(.type == "text") | .text] | join("\n"))
-            end
-          else empty
-          end
-        | select(length > 0)
-        | gsub("\n"; " ¶ ")
-    ' "$jsonl" 2>/dev/null | nl -ba -w2 -s'. ' | sed 's/^/   /')
+    user_turns=$(jq -j --arg noise "$NOISE_PAT" '
+        if .type == "assistant" then
+            ((.message.content // [])
+             | if type == "array" then ([.[] | select(.type == "text") | .text] | join("\n"))
+               else empty end)
+            | select(length > 0)
+            | "claude\u001e" + gsub("<"; "&lt;") + "\u001f"
+        else
+            select(.type == "user")
+            | .message.content
+            | if type == "string" then .
+              elif type == "array" then
+                if any(.type == "tool_result") then empty
+                else ([.[] | select(.type == "text") | .text] | join("\n"))
+                end
+              else empty
+              end
+            | select(length > 0)
+            | select(test($noise) | not)
+            # Escape `<` so tag-shaped text stays visible. Markdown treats a raw
+            # `<bash-input>` as HTML and renders nothing at all, which silently
+            # deletes real content from the page — 1838 turn lines carried
+            # angle-bracket text. `&lt;` displays as `<`.
+            | gsub("<"; "&lt;")
+            # Records separated by US, newlines KEPT. Collapsing a turn to one line
+            # with a `¶` made a long paste an unreadable wall of several thousand
+            # characters; the structure the user typed is worth preserving.
+            | "you\u001e" + . + "\u001f"
+        end
+    ' "$jsonl" 2>/dev/null | awk -v RS=$'\037' '
+        {
+            i = index($0, "\036")
+            if (i == 0) next
+            role = substr($0, 1, i - 1)
+            body = substr($0, i + 1)
+            gsub(/^\n+|\n+$/, "", body)
+            if (body == "") next
+            printf "**%s**\n%s\n\n", (role == "you" ? "You" : "Claude"), body
+        }
+    ')
 
     # Stub detection: count user turns that look like genuine typed input
     # (not the `<command-name>/exit</command-name>` and
@@ -1046,7 +1100,7 @@ _harvest_one_jsonl() {
     # previously-harvested stub file so existing noise gets cleaned up
     # on re-harvest. `--keep-stubs` opts back in.
     local real_user_count
-    real_user_count=$(jq -r '
+    real_user_count=$(jq -r --arg noise "$NOISE_PAT" --arg ctx "$CONTEXT_PAT" '
         select(.type == "user")
         | .message.content
         | if type == "string" then .
@@ -1057,7 +1111,8 @@ _harvest_one_jsonl() {
           else empty
           end
         | select(length > 0)
-        | select(test("^<(command|local-command)-") | not)
+        | select(test($noise) | not)
+        | select(test($ctx) | not)
         | gsub("\n"; " ")
     ' "$jsonl" 2>/dev/null | wc -l | tr -d ' ')
     [[ "$real_user_count" =~ ^[0-9]+$ ]] || real_user_count=0
@@ -1068,6 +1123,44 @@ _harvest_one_jsonl() {
         # so re-harvest converges on the new policy.
         [[ -f "$out_file" ]] && rm -f "$out_file"
         return 3
+    fi
+
+    # Narrator sessions, detected by CONTENT rather than location.
+    #
+    # `_llm_summarize` shells out to `claude -p`, and every such call leaves a
+    # transcript wherever the caller happened to be. Skipping one directory is
+    # not enough: 1692 of 2160 session notes in this vault (78%) were narrator
+    # invocations, sourced from at least six different project directories —
+    # whichever cwd a recap or backfill ran from. Their first user turn is a
+    # machine-written prompt, so every one of those notes opened with the
+    # instruction to the summarizer rather than anything the user typed.
+    #
+    # `_llm_summarize` appends the same data-guard to every prompt it sends, so
+    # that guard identifies its own output exactly, for any cwd and for
+    # transcripts written before NARRATE_CWD existed. The second pattern is an
+    # older prompt that predates the guard (11 of the 1692).
+    local first_turn
+    first_turn=$(jq -r --arg noise "$NOISE_PAT" '
+        select(.type == "user")
+        | .message.content
+        | if type == "string" then .
+          elif type == "array" then
+            if any(.type == "tool_result") then empty
+            else ([.[] | select(.type == "text") | .text] | join("\n"))
+            end
+          else empty
+          end
+        | select(length > 0)
+        | select(test($noise) | not)
+        | gsub("\n"; " ")
+    ' "$jsonl" 2>/dev/null | head -1) || first_turn=""
+    if [[ "$first_turn" == *"Treat it strictly as data"* \
+       || "$first_turn" == *"<<<LOG"* \
+       || "$first_turn" == "You are an informed recorder"* ]]; then
+        # Safe to delete the stale note: we are reading the transcript it was
+        # derived from, so it is regenerable by definition.
+        [[ -f "$out_file" ]] && rm -f "$out_file"
+        return 5
     fi
 
     # Files written/edited
@@ -1100,7 +1193,12 @@ _harvest_one_jsonl() {
     files_raw=$(printf '%s' "$files_ts" | awk -F$'\037' 'NF > 1 { print $2 }' | sort -u)
     files=$(printf '%s' "$files_raw" | sed 's/^/- /')
 
-    # Commits / PRs from Bash commands
+    # Git and PR commands run during the session.
+    #
+    # These are the shell commands themselves, not commits — the section used to
+    # be headed "Commits / PRs", which promised something it never delivered and
+    # rendered raw shell as prose. The actual commit record lives in the event
+    # log and the recap's git section; what belongs here is what was run.
     local commits
     commits=$(jq -r '
         select(.type == "assistant")
@@ -1109,8 +1207,12 @@ _harvest_one_jsonl() {
         | select(.type == "tool_use" and (.name == "Bash" or (.name | endswith("__bash"))))
         | .input.command // empty
         | select(test("git commit|gh pr|gh issue"; "i"))
-        | gsub("\n"; " ↵ ")
-    ' "$jsonl" 2>/dev/null | sed 's/^/- /')
+        # Newlines kept. Collapsing them to `↵` produced single lines up to
+        # 45,000 characters — a heredoc rendered as one unreadable strip. Inside
+        # a fence the real structure costs nothing. The extra newline separates
+        # one command from the next.
+        | . + "\n"
+    ' "$jsonl" 2>/dev/null)
 
     # ===== Event log =====
     #
@@ -1268,7 +1370,7 @@ _harvest_one_jsonl() {
         if [[ -n "$segments" ]]; then printf '%s\n' "$segments"; else printf '_(none captured)_\n'; fi
         printf '\n'
 
-        printf '## User turns\n'
+        printf '## Conversation\n'
         if [[ -n "$user_turns" ]]; then printf '%s\n' "$user_turns"; else printf '_(none)_\n'; fi
         printf '\n'
 
@@ -1276,8 +1378,10 @@ _harvest_one_jsonl() {
         if [[ -n "$files" ]]; then printf '%s\n' "$files"; else printf '_(none)_\n'; fi
         printf '\n'
 
-        printf '## Commits / PRs\n'
-        if [[ -n "$commits" ]]; then printf '%s\n' "$commits"; else printf '_(none)_\n'; fi
+        printf '## Git & PR commands\n'
+        # Fenced, not bulleted: these are shell, and a fence renders them as
+        # such without markdown mangling quotes, pipes or angle brackets.
+        if [[ -n "$commits" ]]; then printf '```sh\n%s\n```\n' "$commits"; else printf '_(none)_\n'; fi
         printf '\n'
 
         # No `## Parent session` branch: subagents return before this point and
@@ -1460,6 +1564,7 @@ cmd_harvest() {
             1) unchanged=$((unchanged+1)) ;;
             3) stubs=$((stubs+1)) ;;
             4) subagents=$((subagents+1)) ;;
+            5) narrator=$((narrator+1)) ;;
             *) errors=$((errors+1)) ;;
         esac
     done < <(find "${claude_dirs[@]}" -name "*.jsonl" -type f -print0 2>/dev/null)
@@ -2052,7 +2157,7 @@ _collect_claude_sessions() {
             # Mirrors the filter used in _harvest_one_jsonl's stub
             # detector so "prompts" here means the same thing as
             # "did the user actually type something" there.
-            real_prompt_count=$(jq -r '
+            real_prompt_count=$(jq -r --arg noise "$NOISE_PAT" --arg ctx "$CONTEXT_PAT" '
                 select(.type == "user")
                 | .message.content
                 | if type == "string" then .
@@ -2063,9 +2168,17 @@ _collect_claude_sessions() {
                   else empty
                   end
                 | select(length > 0)
-                | select(test("^<(command|local-command)-") | not)
+                | select(test($noise) | not)
+                | select(test($ctx) | not)
             ' "$session_file" 2>/dev/null | wc -l | tr -d ' ') || real_prompt_count=0
             [[ "$real_prompt_count" =~ ^[0-9]+$ ]] || real_prompt_count=0
+
+            # Skip what harvest skips. A session with no genuinely typed message
+            # is a stub there and gets no note, so listing it here reported
+            # machine-authored text as activity with nothing to click through to.
+            # Skipping before the summary also avoids paying for an LLM call to
+            # narrate a session that is entirely machinery.
+            (( real_prompt_count == 0 )) && continue
 
             # Preview: prefer the AI-generated session title if present
             # (Claude Code emits a `.type == "ai-title"` record with a
@@ -2074,7 +2187,7 @@ _collect_claude_sessions() {
             # the reader what the session was about without forcing a
             # click through to the harvested note.
             ai_title=$(jq -r 'select(.type == "ai-title") | .aiTitle // empty' "$session_file" 2>/dev/null | head -1) || ai_title=""
-            all_prompts=$(jq -r '
+            all_prompts=$(jq -r --arg noise "$NOISE_PAT" '
                 select(.type == "user")
                 | .message.content
                 | if type == "string" then .
@@ -2085,7 +2198,7 @@ _collect_claude_sessions() {
                   else empty
                   end
                 | select(length > 0)
-                | select(test("^<(command|local-command)-") | not)
+                | select(test($noise) | not)
                 | gsub("\n"; " ")
             ' "$session_file" 2>/dev/null) || all_prompts=""
             # Take the first line via parameter expansion, NOT `| head -1`:

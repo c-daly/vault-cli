@@ -511,6 +511,39 @@ else
     fi
 fi
 
+# === CHECK 11: the recap and the harvest agree on what a session is =========
+# A session holding only machine text is a stub to harvest and gets no note.
+# The recap collector used its own, narrower filter, so it listed such sessions
+# as activity with nothing to click through to — and paid for an LLM call to
+# summarize machinery. The two must stay in agreement.
+MACHINE_SESSION="$PROJECTS_DIR/$PROJECT_NAME/machine-only-session.jsonl"
+{
+    print -r -- '{"type":"summary"}'
+    print -r -- "{\"timestamp\":\"${TARGET_DATE}T09:00:00.000Z\",\"gitBranch\":\"main\",\"cwd\":\"$REPOS_DIR_T\"}"
+    print -r -- "{\"type\":\"user\",\"timestamp\":\"${TARGET_DATE}T09:01:00.000Z\",\"message\":{\"content\":\"<task-notification>MACHINE-ONLY-MARKER</task-notification>\"}}"
+    print -r -- "{\"type\":\"user\",\"timestamp\":\"${TARGET_DATE}T09:02:00.000Z\",\"message\":{\"content\":\"[Request interrupted by user]\"}}"
+} > "$MACHINE_SESSION"
+
+rm -f "$RECAP_FILE"
+run_recap 1 >/dev/null 2>&1
+
+if [[ ! -f "$RECAP_FILE" ]]; then
+    fail "check 11: recap file was not created"
+else
+    if grep -qF "MACHINE-ONLY-MARKER" "$RECAP_FILE"; then
+        fail "check 11a: recap surfaced a machine-only session as activity"
+    else
+        pass "check 11a: machine-only session kept out of the recap"
+    fi
+    # It must not be counted either — a "0 prompts" line is the symptom.
+    if grep -qE '^- [0-9]{2}:[0-9]{2} — 0 prompts' "$RECAP_FILE"; then
+        fail "check 11b: recap listed a session with zero genuine prompts"
+    else
+        pass "check 11b: no zero-prompt session listed"
+    fi
+fi
+rm -f "$MACHINE_SESSION"
+
 # --- Verdict ----------------------------------------------------------------
 print -r -- ""
 if [[ "$fails" -eq 0 ]]; then
