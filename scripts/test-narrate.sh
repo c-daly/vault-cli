@@ -206,6 +206,123 @@ else
     fi
 fi
 
+# === CHECK 5: a pre-sentinel block containing a bare `---` is not truncated =
+# The boundary ambiguity this whole sentinel exists for. Inbox captures are
+# spliced in verbatim and can carry a bare `---`; scanning for one would end the
+# block early and leave the tail of the stale recap beside the replacement.
+HOST_NAME="$(hostname -s 2>/dev/null || hostname)"
+STUB_END="<!-- /auto-recap -->"
+rm -f "$RECAP_FILE" "${RECAP_FILE}.pre-recap.bak"
+cat > "$RECAP_FILE" <<LEGACY
+---
+created: $TARGET_DATE
+type: daily-recap
+---
+
+# legacy fixture
+
+## Auto-Recap ($HOST_NAME)
+_Generated: long ago_
+
+## Inbox
+a captured note
+---
+the capture continues past that separator
+
+## Git & GitHub
+STALE-GIT-SECTION
+
+---
+
+LEGACY-USER-TAIL
+LEGACY
+
+run_recap 1 >/dev/null 2>&1
+
+if [[ ! -f "$RECAP_FILE" ]]; then
+    fail "check 5: recap file vanished on the legacy migration"
+else
+    if grep -qF "LEGACY-USER-TAIL" "$RECAP_FILE"; then
+        pass "check 5a: user text below a legacy block survived"
+    else
+        fail "check 5a: user text below a legacy block was destroyed"
+    fi
+    # The real defect is not truncation — the old code preserved these lines,
+    # but left them sitting BESIDE the new block as if current, producing
+    # duplicated and contradictory sections. Assert containment by ordering:
+    # new block, then its sentinel, then the marker, and only then the stale
+    # content. Anything stale appearing above the marker is loose.
+    ln_end=$(grep -nF -m1 "$STUB_END" "$RECAP_FILE" | cut -d: -f1)
+    ln_mark=$(grep -nF -m1 "superseded pre-sentinel recap" "$RECAP_FILE" | cut -d: -f1)
+    ln_stale=$(grep -nF -m1 "STALE-GIT-SECTION" "$RECAP_FILE" | cut -d: -f1)
+    if [[ -n "$ln_end" && -n "$ln_mark" && -n "$ln_stale" ]] \
+       && (( ln_end < ln_mark && ln_mark < ln_stale )); then
+        pass "check 5b: stale sections are confined below the marker, not beside the new block"
+    else
+        fail "check 5b: stale content is not contained (sentinel=$ln_end marker=$ln_mark stale=$ln_stale)"
+    fi
+    if grep -qF "superseded pre-sentinel recap" "$RECAP_FILE"; then
+        pass "check 5c: the preserved legacy region is explicitly marked"
+    else
+        fail "check 5c: legacy region preserved without a marker"
+    fi
+    # Neutralized so a later run does not treat it as a live recap block.
+    if grep -qF "## (superseded) Auto-Recap ($HOST_NAME)" "$RECAP_FILE"; then
+        pass "check 5d: the old header was neutralized"
+    else
+        fail "check 5d: the old header is still a live '## Auto-Recap' block"
+    fi
+    if [[ -f "${RECAP_FILE}.pre-recap.bak" ]]; then
+        pass "check 5e: a backup was taken before migrating"
+    else
+        fail "check 5e: no backup taken before migrating a legacy block"
+    fi
+    # Second run must now be an ordinary sentinel splice and stay stable.
+    run_recap 1 >/dev/null 2>&1
+    live_blocks=$(grep -c '^## Auto-Recap (' "$RECAP_FILE")
+    if [[ "$live_blocks" -eq 1 ]]; then
+        pass "check 5f: converges to exactly one live block on the next run"
+    else
+        fail "check 5f: expected 1 live block after migration, found $live_blocks"
+    fi
+    if grep -qF "LEGACY-USER-TAIL" "$RECAP_FILE"; then
+        pass "check 5g: user text still present after the second run"
+    else
+        fail "check 5g: second run destroyed the user text"
+    fi
+fi
+
+# === CHECK 6: NARRATE=0 ignores an ai-title and uses the first prompt =======
+# The fixture used above deliberately has no ai-title, so this path was
+# uncovered: with narration off, a session carrying an ai-title must still fall
+# back to the first user prompt rather than showing the title.
+AI_SESSION="$PROJECTS_DIR/$PROJECT_NAME/ai-title-session.jsonl"
+{
+    print -r -- '{"type":"summary"}'
+    print -r -- "{\"timestamp\":\"${TARGET_DATE}T10:00:00.000Z\",\"gitBranch\":\"main\",\"cwd\":\"$REPOS_DIR_T\"}"
+    print -r -- '{"type":"ai-title","aiTitle":"AI-GENERATED-TITLE-MARKER"}'
+    print -r -- "{\"type\":\"user\",\"timestamp\":\"${TARGET_DATE}T10:01:00.000Z\",\"message\":{\"content\":\"AITITLE-FIRST-PROMPT\"}}"
+} > "$AI_SESSION"
+
+rm -f "$RECAP_FILE"
+run_recap 0 >/dev/null 2>&1
+
+if [[ ! -f "$RECAP_FILE" ]]; then
+    fail "check 6: recap file was not created"
+else
+    if grep -qF "AI-GENERATED-TITLE-MARKER" "$RECAP_FILE"; then
+        fail "check 6a: NARRATE=0 used the ai-title instead of the first prompt"
+    else
+        pass "check 6a: NARRATE=0 did not fall back to the ai-title"
+    fi
+    if grep -qF "AITITLE-FIRST-PROMPT" "$RECAP_FILE"; then
+        pass "check 6b: NARRATE=0 fell back to the first user prompt"
+    else
+        fail "check 6b: first user prompt missing for the ai-title session"
+    fi
+fi
+rm -f "$AI_SESSION"
+
 # --- Verdict ----------------------------------------------------------------
 print -r -- ""
 if [[ "$fails" -eq 0 ]]; then

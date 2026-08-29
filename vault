@@ -1693,24 +1693,48 @@ cmd_recap() {
             # delete whatever the user wrote below it. That case is not
             # recoverable by inspection — the old block body and the user's own
             # text are indistinguishable — so keep a backup instead of guessing.
-            local legacy_unterminated=0
-            # Check EVERY same-host block, not just the first. A file can carry
-            # leftover duplicates, and it is a later one being unterminated that
-            # is dangerous: the first block terminating cleanly would otherwise
-            # let the guard pass while the splice below still ran to EOF.
+            # Is the first same-host block sentinel-terminated? Only a sentinel
+            # is an unambiguous boundary. A bare `---` is not: inbox captures
+            # are spliced into the block verbatim and may contain one, so
+            # scanning for `---` can end the block early and leave the tail of
+            # the stale recap sitting beside the new one.
+            local legacy_block=0
             awk -v host="$host" -v recap_end="$RECAP_END" '
-                BEGIN { inblock = 0; bad = 0; sub_pat = "^## Auto-Recap \\(" host "\\)$" }
-                $0 ~ sub_pat { if (inblock) bad = 1; inblock = 1; next }
-                inblock && ($0 == recap_end || /^---$/) { inblock = 0; next }
-                END { exit (bad || inblock) ? 1 : 0 }
-            ' "$recap_file" || legacy_unterminated=1
+                BEGIN { inblock = 0; found = 0; sub_pat = "^## Auto-Recap \\(" host "\\)$" }
+                !inblock && $0 ~ sub_pat { inblock = 1; next }
+                inblock && $0 == recap_end { found = 1; exit }
+                END { exit found ? 0 : 1 }
+            ' "$recap_file" || legacy_block=1
 
-            if (( legacy_unterminated )); then
+            if (( legacy_block )); then
+                # Pre-sentinel block: its end cannot be determined, so do not
+                # guess. Write the new block, then preserve the old region
+                # verbatim beneath a marker, with its header neutralized so a
+                # later run treats it as ordinary prose rather than a recap
+                # block. Nothing is deleted and nothing is truncated; the
+                # duplication is explicit and one-time, and a human can remove
+                # the marked region once. This is the migration pass — every
+                # block written from here on carries a sentinel.
                 cp "$recap_file" "${recap_file}.pre-recap.bak"
-                print -u2 "  ! ${recap_file:t}: existing recap block has no terminator;"
-                print -u2 "    backed up to ${recap_file:t}.pre-recap.bak before splicing"
-            fi
-
+                print -u2 "  ! ${recap_file:t}: pre-sentinel recap block; its end is ambiguous"
+                print -u2 "    (inbox captures may contain a bare '---'), so the old block is"
+                print -u2 "    preserved and marked instead of guessed at."
+                print -u2 "    Backup: ${recap_file:t}.pre-recap.bak"
+                awk -v host="$host" -v block_file="$block_tmp" -v recap_end="$RECAP_END" '
+                    BEGIN { done = 0; sub_pat = "^## Auto-Recap \\(" host "\\)$" }
+                    !done && $0 ~ sub_pat {
+                        while ((getline line < block_file) > 0) print line
+                        close(block_file)
+                        print recap_end
+                        print ""
+                        print "<!-- superseded pre-sentinel recap preserved below: its boundary could not be determined unambiguously. Verify and delete. -->"
+                        print "## (superseded) Auto-Recap (" host ")"
+                        done = 1
+                        next
+                    }
+                    { print }
+                ' "$recap_file" > "$spliced_tmp"
+            else
             awk -v host="$host" -v block_file="$block_tmp" -v recap_end="$RECAP_END" '
                 BEGIN { state = 0; held = ""; sub_pat = "^## Auto-Recap \\(" host "\\)$" }
                 state == 0 {
@@ -1725,9 +1749,12 @@ cmd_recap() {
                 }
                 state == 1 {
                     if ($0 == recap_end) { state = 2; print; held = ""; next }
-                    # Legacy block terminated by a bare `---`: emit the sentinel
-                    # as we pass, migrating the file to the unambiguous marker.
-                    if (/^---$/) { print recap_end; print ""; state = 2; print; held = ""; next }
+                    # A bare `---` is deliberately NOT accepted as a boundary.
+                    # Inbox captures are spliced in verbatim and may contain one,
+                    # so treating it as the end truncates the block and leaves
+                    # stale generated sections beside the replacement. Blocks
+                    # without a sentinel never reach here — they take the
+                    # supersede path above, which does not guess.
                     held = held $0 "\n"   # hold, do not drop — see END
                     next
                 }
@@ -1739,7 +1766,7 @@ cmd_recap() {
                     next
                 }
                 state == 3 {
-                    if ($0 == recap_end || /^---$/) { state = 2; held = ""; next }
+                    if ($0 == recap_end) { state = 2; held = ""; next }
                     held = held $0 "\n"
                     next
                 }
@@ -1753,6 +1780,7 @@ cmd_recap() {
                     if (state == 1 || state == 3) printf "%s", held
                 }
             ' "$recap_file" > "$spliced_tmp"
+            fi
 
             # Idempotency: if the new content matches existing modulo the
             # `_Generated:` timestamp line, skip the write entirely. The
