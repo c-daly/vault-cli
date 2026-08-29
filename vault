@@ -39,13 +39,15 @@ _claude_roots() {
 # knew about `<command-…>`.
 #
 # NOISE is machine text that should never be rendered or counted.
-NOISE_PAT='^(<(command|local-command)-|<system-reminder>|Base directory for this skill:|Caveat: The messages below|This session is being continued|#[[:space:]]+.*[[:space:]]Skill([[:space:]]|$))'
+NOISE_PAT='^(<(command|local-command)-|<system-reminder>|<task-notification>|Base directory for this skill:|Caveat: The messages below|This session is being continued|#[[:space:]]+.*[[:space:]]Skill([[:space:]]|$))'
 #
 # CONTEXT is real but not typed by the user: an interruption they performed, a
-# message another agent sent. Worth showing inside a session that has real
-# turns, but a session containing ONLY these is not a session — it is machinery
-# talking, and gets skipped as a stub.
-CONTEXT_PAT='^(\[Request interrupted by user|<teammate-message)'
+# message another agent sent, the output of a command they ran. Worth showing
+# inside a session that has real turns, but a session containing ONLY these is
+# not a session — it is machinery talking, and gets skipped as a stub.
+#
+# `<bash-input>` is deliberately NOT here: the user typed that command.
+CONTEXT_PAT='^(\[Request interrupted by user|<teammate-message|<bash-stdout|Another Claude session sent a message:)'
 
 # Unambiguous end-of-block marker for `## Auto-Recap (HOST)` sections. An HTML
 # comment renders as nothing in Obsidian and cannot collide with note content
@@ -1042,6 +1044,11 @@ _harvest_one_jsonl() {
     # User turns. Drops NOISE outright; keeps CONTEXT, because an interruption
     # or another agent's message is part of what happened in a session that has
     # real turns — it just cannot be the ONLY thing in one (see the stub check).
+    #
+    # Numbered at column 0. The previous `nl -w2` + 3-space indent right-aligned
+    # the number, so single-digit turns began with FOUR spaces — which CommonMark
+    # reads as an indented code block. Turns 1-9 rendered as preformatted text
+    # while 10+ rendered as a list, in the same section.
     local user_turns
     user_turns=$(jq -r --arg noise "$NOISE_PAT" '
         select(.type == "user")
@@ -1056,7 +1063,12 @@ _harvest_one_jsonl() {
         | select(length > 0)
         | select(test($noise) | not)
         | gsub("\n"; " ¶ ")
-    ' "$jsonl" 2>/dev/null | nl -ba -w2 -s'. ' | sed 's/^/   /')
+        # Escape `<` so tag-shaped text stays visible. Markdown treats a raw
+        # `<bash-input>` as HTML and renders nothing at all, which silently
+        # deletes real content from the page — 1838 turn lines carried
+        # angle-bracket text. `&lt;` displays as `<`.
+        | gsub("<"; "&lt;")
+    ' "$jsonl" 2>/dev/null | awk '{ printf "%d. %s\n", NR, $0 }')
 
     # Stub detection: count user turns that look like genuine typed input
     # (not the `<command-name>/exit</command-name>` and
