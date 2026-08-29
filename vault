@@ -2157,7 +2157,7 @@ _collect_claude_sessions() {
             # Mirrors the filter used in _harvest_one_jsonl's stub
             # detector so "prompts" here means the same thing as
             # "did the user actually type something" there.
-            real_prompt_count=$(jq -r '
+            real_prompt_count=$(jq -r --arg noise "$NOISE_PAT" --arg ctx "$CONTEXT_PAT" '
                 select(.type == "user")
                 | .message.content
                 | if type == "string" then .
@@ -2168,9 +2168,17 @@ _collect_claude_sessions() {
                   else empty
                   end
                 | select(length > 0)
-                | select(test("^<(command|local-command)-") | not)
+                | select(test($noise) | not)
+                | select(test($ctx) | not)
             ' "$session_file" 2>/dev/null | wc -l | tr -d ' ') || real_prompt_count=0
             [[ "$real_prompt_count" =~ ^[0-9]+$ ]] || real_prompt_count=0
+
+            # Skip what harvest skips. A session with no genuinely typed message
+            # is a stub there and gets no note, so listing it here reported
+            # machine-authored text as activity with nothing to click through to.
+            # Skipping before the summary also avoids paying for an LLM call to
+            # narrate a session that is entirely machinery.
+            (( real_prompt_count == 0 )) && continue
 
             # Preview: prefer the AI-generated session title if present
             # (Claude Code emits a `.type == "ai-title"` record with a
@@ -2179,7 +2187,7 @@ _collect_claude_sessions() {
             # the reader what the session was about without forcing a
             # click through to the harvested note.
             ai_title=$(jq -r 'select(.type == "ai-title") | .aiTitle // empty' "$session_file" 2>/dev/null | head -1) || ai_title=""
-            all_prompts=$(jq -r '
+            all_prompts=$(jq -r --arg noise "$NOISE_PAT" '
                 select(.type == "user")
                 | .message.content
                 | if type == "string" then .
@@ -2190,7 +2198,7 @@ _collect_claude_sessions() {
                   else empty
                   end
                 | select(length > 0)
-                | select(test("^<(command|local-command)-") | not)
+                | select(test($noise) | not)
                 | gsub("\n"; " ")
             ' "$session_file" 2>/dev/null) || all_prompts=""
             # Take the first line via parameter expansion, NOT `| head -1`:
