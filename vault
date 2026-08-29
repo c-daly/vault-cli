@@ -127,12 +127,26 @@ _journal_path() {
 # timestamps, so strip the fractional part + Z, parse via strptime as
 # UTC broken-down time, convert to epoch via mktime, then format in
 # local time via strflocaltime.
+#
+# Handles both forms that reach it: Claude timestamps end in `Z`, but git's
+# `%aI` emits an explicit offset (`2026-08-29T01:00:00+02:00`). The original
+# expression only stripped `Z`, so an offset timestamp failed to parse and the
+# caller silently fell back to the first ten characters — the *author's* local
+# date. A commit made at 01:00+02:00 then filed under the 29th while the recap
+# collector, working in local time, listed it under the 28th.
 _iso_to_local_date() {
     jq -nr --arg ts "$1" '
-        $ts
-        | sub("\\..*Z$|Z$"; "")
-        | strptime("%Y-%m-%dT%H:%M:%S")
-        | mktime
+        ($ts | sub("\\.[0-9]+"; ""))
+        | if test("Z$") then
+              (sub("Z$"; "") | strptime("%Y-%m-%dT%H:%M:%S") | mktime)
+          elif test("[+-][0-9]{2}:[0-9]{2}$") then
+              (capture("(?<base>.*)(?<sign>[+-])(?<oh>[0-9]{2}):(?<om>[0-9]{2})$")
+               | (.base | strptime("%Y-%m-%dT%H:%M:%S") | mktime)
+                 - ((if .sign == "+" then 1 else -1 end)
+                    * ((.oh | tonumber) * 3600 + (.om | tonumber) * 60)))
+          else
+              (strptime("%Y-%m-%dT%H:%M:%S") | mktime)
+          end
         | strflocaltime("%Y-%m-%d")
     ' 2>/dev/null
 }
@@ -148,6 +162,329 @@ _iso_to_local_time() {
         | mktime
         | strflocaltime("%H:%M")
     ' 2>/dev/null
+}
+
+# --- Event log ---
+#
+# An append-only machine-readable record emitted ALONGSIDE the existing journal,
+# never instead of it. The markdown surfaces (journal/YYYY/MM/*.md, the per-host
+# `## Auto-Recap` blocks, 30-resources/claude-sessions/) are untouched by any of
+# this: events are extracted from the session transcripts and from git directly,
+# so the notes are a rendered view over the log rather than an input to it. That
+# is deliberate — nothing here ever parses a note, so the note format stays free
+# to change later without breaking any query.
+#
+# Layout: $VAULT_DIR/events/<host>/YYYY-MM.jsonl
+#
+# The per-host directory is the point. Two machines appending on the same day
+# write to different files, so `cmd_sync`'s `git pull --rebase` stays a
+# fast-forward and no host's writes are lost to last-write-wins.
+#
+# The envelope is deliberately narrow — id, ts, local_date, host, source, tier,
+# payload — with everything source-specific left opaque inside `payload`.
+# Normalising one schema across every source is the failure mode that kills
+# logs like this one.
+EVENTS_DIR="${VAULT_EVENTS_DIR:-$VAULT_DIR/events}"
+
+typeset -gA _EVENT_SEEN=()
+typeset -gA _EVENT_PARTITION_LOADED=()
+typeset -gA _EVENT_PARTITION_LINES=()
+
+# Canonicalize a path so the SAME directory, reported by different clients,
+# collapses to one string. A session started from PowerShell reports
+# `C:\Users\cddal\HexWars`, some tools report `C:/Users/cddal/HexWars`, and the
+# repo scan sees those very same files through the WSL mount as
+# `/mnt/c/Users/cddal/HexWars`. Left alone, one repo's work splits across three
+# thread keys and the session that did the work never joins the commits it
+# produced — measured on HexWars, which had 465 commit events on one side of
+# the split and every one of its sessions on the other.
+_canonical_path() {
+    local p="$1"
+    [[ -n "$p" ]] || return 0
+    # Drive-letter forms -> the WSL mount point for that drive.
+    if [[ "$p" == [A-Za-z]:[\\/]* ]]; then
+        local drive="${p:0:1}"
+        p="/mnt/${drive:l}/${p:3}"
+    fi
+    p="${p//\\//}"
+    # Collapse duplicate slashes and `.`/`..` segments so `/mnt/c/X//` and
+    # `/mnt/c/./X` key the same as `/mnt/c/X`. `:a` is lexical — it does not
+    # touch the filesystem and does not resolve symlinks, which matters because
+    # `cd` keeps the logical path and the recorded cwd is the logical one.
+    #
+    # A RELATIVE path is deliberately left alone. `:a` would resolve it against
+    # this process's cwd, which is wherever `vault` happens to be run from, not
+    # the cwd of the session that recorded it — that would invent a confidently
+    # wrong absolute path. Better an un-joined relative key than a false join.
+    [[ "$p" == /* ]] && p="${p:a}"
+    [[ "$p" == "/" ]] || p="${p%/}"
+    printf '%s' "$p"
+}
+
+typeset -gA _THREAD_ROOT_CACHE=()
+typeset -gA _REPO_ID_CACHE=()
+
+# Machine-independent identity for a repo: its origin remote, normalized so that
+# transport and scheme do not matter.
+#
+#   git@github.com:c-daly/vault.git      -> github.com/c-daly/vault
+#   https://github.com/c-daly/vault.git  -> github.com/c-daly/vault
+#
+# An absolute path cannot serve as the thread key, because it encodes a username
+# and a mount layout. That breaks joins across the three machines this vault
+# syncs between — and it already breaks them on ONE machine: the vault repo is
+# cloned at both ~/projects/vault (Claude's) and /mnt/c/vault (Obsidian's), and
+# those are the same repo. Per-host write partitions exist precisely so that
+# READS can key on the work thread rather than the host; a host-specific key
+# would defeat that.
+#
+# With no remote, fall back to a deliberately HOST-SCOPED key. Nothing then
+# proves two same-looking paths on different machines are the same thing, and an
+# unqualified path would silently claim they are. An honestly machine-scoped key
+# beats a false join.
+_repo_identity() {
+    local root="$1"
+    [[ -n "$root" ]] || return 0
+    if [[ -n "${_REPO_ID_CACHE[$root]:-}" ]]; then
+        printf '%s' "${_REPO_ID_CACHE[$root]}"
+        return 0
+    fi
+    local url="" id=""
+    if [[ -d "$root" ]]; then
+        url=$(git -C "$root" remote get-url origin 2>/dev/null) || url=""
+    fi
+    if [[ -n "$url" ]]; then
+        id="${url#*://}"    # drop scheme
+        id="${id#*@}"       # drop user@
+        id="${id/://}"      # scp-style host:owner/repo -> host/owner/repo
+        id="${id%.git}"
+        id="${id%/}"
+    else
+        id="$(vault_hostname):$root"
+    fi
+    _REPO_ID_CACHE[$root]="$id"
+    printf '%s' "$id"
+}
+
+# Thread key for a working directory: the identity of the repo containing it.
+#
+# Walking up to the repo root is what lets a session run from a subdirectory
+# (`HexWars/Assets/HexWars/Presentation`) join that repo's commits; turning the
+# root into a remote-derived identity is what lets it join across clones and
+# across machines. Fail-soft by design — an unreachable or moved path is
+# host-scoped rather than dropped.
+_thread_key() {
+    local p
+    p="$(_canonical_path "$1")"
+    [[ -n "$p" ]] || return 0
+    if [[ -n "${_THREAD_ROOT_CACHE[$p]:-}" ]]; then
+        printf '%s' "${_THREAD_ROOT_CACHE[$p]}"
+        return 0
+    fi
+    local root="" key=""
+    if [[ -d "$p" ]]; then
+        root=$(git -C "$p" rev-parse --show-toplevel 2>/dev/null) || root=""
+    fi
+    if [[ -n "$root" ]]; then
+        key="$(_repo_identity "$root")"
+    else
+        # Not a repo, or gone. Host-scope it: a bare `/home/<user>/notes` would
+        # otherwise collide with an unrelated same-named path on another machine.
+        key="$(vault_hostname):$p"
+    fi
+    _THREAD_ROOT_CACHE[$p]="$key"
+    printf '%s' "$key"
+}
+
+# Month partition for a given LOCAL date. Monthly keeps a single file browsable
+# while staying coarse enough that appends stay cheap.
+_event_file() {
+    printf '%s/%s/%s.jsonl' "$EVENTS_DIR" "$(vault_hostname)" "${1:0:7}"
+}
+
+# Load the ids already present in a partition, once per partition per process.
+# `vault backfill` re-derives EVERY date from scratch on every run, so without
+# this each run would append a second copy of all history. Dedup is per EVENT
+# id (content-derived: session id, commit sha, segment start) and never
+# per-run — whole-run idempotency silently drops data as soon as more than one
+# writer targets the same day.
+_event_load_partition() {
+    local f="$1"
+    [[ -n "${_EVENT_PARTITION_LOADED[$f]:-}" ]] && return 0
+    _EVENT_PARTITION_LOADED[$f]=1
+    _EVENT_PARTITION_LINES[$f]=0
+    _event_refresh_partition "$f"
+    return 0
+}
+
+# Pick up ids appended by ANOTHER process since we last looked. Only the new
+# tail is parsed, so this stays cheap no matter how large the partition grows.
+_event_refresh_partition() {
+    local f="$1"
+    local have="${_EVENT_PARTITION_LINES[$f]:-0}" now=0 id
+    [[ -f "$f" ]] || { _EVENT_PARTITION_LINES[$f]=0; return 0; }
+    now=$(wc -l < "$f" 2>/dev/null | tr -d ' ') || now=0
+    [[ "$now" =~ ^[0-9]+$ ]] || now=0
+    if (( now > have )); then
+        while IFS= read -r id; do
+            [[ -n "$id" ]] && _EVENT_SEEN[$id]=1
+        done < <(tail -n +$((have + 1)) "$f" 2>/dev/null | jq -r '.id // empty' 2>/dev/null || true)
+    fi
+    _EVENT_PARTITION_LINES[$f]=$now
+    return 0
+}
+
+# Advisory lock on a partition. `mkdir` is atomic on POSIX, which `flock` is not
+# universally available to be — this runs under launchd on macOS too.
+#
+# The wait deliberately exceeds the staleness window below, so acquisition is
+# effectively guaranteed: a lock held by a live writer is released in
+# milliseconds (it spans one append), and a lock orphaned by a killed run is
+# reclaimed after two minutes. Giving up earlier and appending anyway is what
+# the caller must never do — see _emit_event.
+_event_lock() {
+    local lock="$1.lock" waited=0 holder="" rholder=""
+    # `ln -s` is atomic AND records the owner in the SAME operation, so unlike
+    # `mkdir` followed by a separate pid write there is never an instant where
+    # the lock exists with no known holder. That gap was the last place an
+    # age-based reclaim could evict a live writer, and with it gone the age
+    # heuristic goes too: ownership is decided purely by whether the recorded
+    # process is still alive.
+    #
+    # This matters because pauses are ordinary here — WSL2 suspends the whole VM
+    # and laptops sleep — and evicting a merely-slow holder would put two writers
+    # in the critical section, which is the duplicate the lock exists to prevent.
+    while true; do
+        # A real directory here is a lock from the earlier mkdir-based scheme,
+        # which recorded its owner in `lock/pid`. It must be resolved BEFORE the
+        # `ln -s` attempt: `ln -s target dir` does not fail, it creates the link
+        # INSIDE the directory and reports success, which would hand out a lock
+        # nobody holds while the legacy holder is still writing.
+        if [[ -d "$lock" && ! -L "$lock" ]]; then
+            holder=$(cat "$lock/pid" 2>/dev/null) || holder=""
+            if [[ -z "$holder" ]] || ! kill -0 "$holder" 2>/dev/null; then
+                rm -f "$lock/pid" 2>/dev/null || true
+                rmdir "$lock" 2>/dev/null || true
+            else
+                sleep 0.2
+            fi
+            waited=$((waited + 1))
+            (( waited > 900 )) && return 1
+            continue
+        fi
+
+        ln -s "$$" "$lock" 2>/dev/null && return 0
+
+        holder=$(readlink "$lock" 2>/dev/null) || holder=""
+        if [[ -z "$holder" ]] || ! kill -0 "$holder" 2>/dev/null; then
+            # Reaping must be serialized. Two waiters can observe the same dead
+            # holder at the same moment; if both then delete, the second removes
+            # the lock the first has just legitimately acquired and both enter
+            # the critical section — the duplicate this is all here to prevent.
+            #
+            # Only the waiter that wins `$lock.reap` may remove, and it re-reads
+            # under that right. The stale lock is still in place at that moment,
+            # so no new holder can have appeared in between.
+            if ln -s "$$" "$lock.reap" 2>/dev/null; then
+                holder=$(readlink "$lock" 2>/dev/null) || holder=""
+                if [[ -z "$holder" ]] || ! kill -0 "$holder" 2>/dev/null; then
+                    rm -f "$lock" 2>/dev/null || true
+                fi
+                rm -f "$lock.reap" 2>/dev/null || true
+            else
+                # Another waiter is reaping. Release its right only if it died.
+                rholder=$(readlink "$lock.reap" 2>/dev/null) || rholder=""
+                if [[ -n "$rholder" ]] && ! kill -0 "$rholder" 2>/dev/null; then
+                    rm -f "$lock.reap" 2>/dev/null || true
+                else
+                    sleep 0.2
+                fi
+            fi
+        else
+            sleep 0.2
+        fi
+        # Counted on both paths so a lock that can never be cleared still exits.
+        waited=$((waited + 1))
+        (( waited > 900 )) && return 1   # ~3min; caller skips rather than races
+    done
+}
+
+_event_unlock() { rm -f "$1.lock" 2>/dev/null || true; }
+
+# _emit_event <id> <iso_ts> <source> <tier> [payload_json]
+#
+# tier is `observed` for anything measured off an artifact on disk. `deduced` is
+# reserved for model-inferred activity (e.g. "I was thinking about this on a
+# walk"), which must carry its evidence in the payload and must never be mixed
+# in as observed.
+#
+# Returns 0 if written, 1 if already present (a no-op re-run) or on bad input.
+#
+# The check-and-append is serialized by a lock (see _event_lock), so overlapping
+# runs on the same host converge on a single copy of each id. If the lock cannot
+# be taken the event is SKIPPED rather than appended unsynchronized: the log is
+# a derivation and a missed event comes back on the next harvest, while a
+# duplicate in an append-only file does not go away.
+_emit_event() {
+    local id="$1" ts="$2" src="$3" tier="$4"
+    local payload="${5:-}"
+    [[ -n "$payload" ]] || payload='{}'
+    [[ -n "$id" && -n "$ts" ]] || return 1
+
+    # Bucket by LOCAL date: "what was I doing on the 12th" means his 12th, and
+    # the local day is NOT recoverable from a UTC instant once the machine has
+    # changed timezone. So it is stored at capture, not re-derived at query time.
+    local local_date
+    local_date=$(_iso_to_local_date "$ts") || local_date=""
+    [[ -n "$local_date" ]] || local_date="${ts:0:10}"
+
+    local f
+    f=$(_event_file "$local_date")
+    _event_load_partition "$f"
+    [[ -n "${_EVENT_SEEN[$id]:-}" ]] && return 1
+
+    mkdir -p "${f:h}"
+
+    # Serialize the check-and-append. Without this, two overlapping runs on the
+    # same host (a manual backfill racing the 23:00 cron, say) each load the
+    # partition, both see the id as absent, and both append it — permanently,
+    # since later runs suppress copies but cannot remove one.
+    # Never append unsynchronized. An earlier version proceeded without the lock
+    # once the wait expired, which reopened the very race the lock exists to
+    # close — and a duplicate in an append-only log is permanent, whereas a
+    # skipped event is not: the log is a derivation, recoverable by re-running
+    # harvest against the transcripts and git. Drop is cheap, duplicate is not.
+    if ! _event_lock "$f"; then
+        print -u2 "  ! event log: could not lock ${f:t} after 3min; skipping $id"
+        return 1
+    fi
+    # Re-check under the lock: the id may have been appended by the other writer
+    # between our load and now.
+    local rc=0
+    _event_refresh_partition "$f"
+    if [[ -n "${_EVENT_SEEN[$id]:-}" ]]; then
+        _event_unlock "$f"
+        return 1
+    fi
+
+    jq -cn \
+        --arg id "$id" \
+        --arg ts "$ts" \
+        --arg local_date "$local_date" \
+        --arg host "$(vault_hostname)" \
+        --arg source "$src" \
+        --arg tier "$tier" \
+        --argjson payload "$payload" \
+        '{id:$id, ts:$ts, local_date:$local_date, host:$host,
+          source:$source, tier:$tier, payload:$payload}' \
+        >> "$f" 2>/dev/null || rc=1
+
+    if (( rc == 0 )); then
+        _EVENT_SEEN[$id]=1
+        _EVENT_PARTITION_LINES[$f]=$(( ${_EVENT_PARTITION_LINES[$f]:-0} + 1 ))
+    fi
+    _event_unlock "$f"
+    return $rc
 }
 
 # --- Subcommands ---
@@ -610,17 +947,30 @@ _harvest_one_jsonl() {
     local title="${ai_title:-$sid}"
 
     # Work segments: emit on (cwd,branch) change
-    local segments
-    segments=$(jq -r '
+    #
+    # Extracted ONCE as TSV, then rendered twice: as the markdown below (kept
+    # byte-identical to what this produced before the event log existed, so
+    # re-harvesting does not churn every session note in git) and as `segment`
+    # events. (cwd, branch) is the thread key the reconstruction query joins
+    # on, so it is captured here where the transcript already yields it rather
+    # than reconstructed by interval-joining after the fact.
+    # Fields are separated by US (0x1f), NOT tab. `read` splits on IFS, and a
+    # tab is IFS *whitespace*, so zsh collapses runs of it and strips leading
+    # ones: a row whose first field is empty (a record with no timestamp, which
+    # the extraction below explicitly admits) would shift every later field left
+    # by one. US is not whitespace, so empty fields survive intact — and a path
+    # containing a literal tab can no longer split a field either.
+    local segments_tsv
+    segments_tsv=$(jq -r '
         select(.cwd or .gitBranch)
-        | "\(.timestamp // "")\t\(.cwd // "?")\t\(.gitBranch // "?")"
-    ' "$jsonl" 2>/dev/null | awk -F'\t' '
+        | "\(.timestamp // "")\u001f\(.cwd // "?")\u001f\(.gitBranch // "?")"
+    ' "$jsonl" 2>/dev/null | awk -F$'\037' '
         BEGIN { key=""; start=""; cwd=""; branch=""; last_ts="" }
         {
             newkey = $2 "|" $3
             if (newkey != key) {
                 if (key != "") {
-                    printf "- %s → %s  %s @%s\n", start, last_ts, cwd, branch
+                    printf "%s\037%s\037%s\037%s\n", start, last_ts, cwd, branch
                 }
                 key = newkey; start = $1; cwd = $2; branch = $3
             }
@@ -628,9 +978,14 @@ _harvest_one_jsonl() {
         }
         END {
             if (key != "") {
-                printf "- %s → %s  %s @%s\n", start, last_ts, cwd, branch
+                printf "%s\037%s\037%s\037%s\n", start, last_ts, cwd, branch
             }
         }
+    ')
+
+    local segments
+    segments=$(printf '%s' "$segments_tsv" | awk -F$'\037' '
+        NF { printf "- %s → %s  %s @%s\n", $1, $2, $3, $4 }
     ')
 
     # User turns (real prompts: skip tool_result-bearing user records)
@@ -670,6 +1025,7 @@ _harvest_one_jsonl() {
           end
         | select(length > 0)
         | select(test("^<(command|local-command)-") | not)
+        | gsub("\n"; " ")
     ' "$jsonl" 2>/dev/null | wc -l | tr -d ' ')
     [[ "$real_user_count" =~ ^[0-9]+$ ]] || real_user_count=0
 
@@ -682,9 +1038,16 @@ _harvest_one_jsonl() {
     fi
 
     # Files written/edited
-    local files
-    files=$(jq -r '
+    #
+    # Extracted as (timestamp, path) pairs so the same pass feeds both the
+    # markdown bullet list (paths only, sorted unique — rendered exactly as
+    # before) and the `artifact` events, which need the time the file was
+    # actually written. Stamping artifacts with the session's last_ts instead
+    # files everything from a session that crosses midnight on the wrong day.
+    local files_ts files_raw files
+    files_ts=$(jq -r '
         select(.type == "assistant")
+        | .timestamp as $ts
         | (.message.content // [])
         | if type == "array" then .[] else empty end
         | select(.type == "tool_use" and (
@@ -692,8 +1055,17 @@ _harvest_one_jsonl() {
             or (.name | endswith("__edit_file"))
             or (.name | endswith("__write_file"))
           ))
-        | .input.file_path // empty
-    ' "$jsonl" 2>/dev/null | sort -u | sed 's/^/- /')
+        | (.input.file_path // empty) as $p
+        | "\($ts // "")\u001f\($p)"
+    ' "$jsonl" 2>/dev/null)
+    # `// empty` above, not `!= null`: jq's `//` also drops `false`, and the
+    # pre-event code used `//`. `!= null` would have rendered a literal
+    # `- false` into the note. It keeps an empty-string path, and so must the
+    # markdown — hence no `/^$/d` here, which would have dropped the `- ` line
+    # the old pipeline emitted. Both are degenerate inputs; the point is that
+    # the rendered note stays byte-for-byte what it was.
+    files_raw=$(printf '%s' "$files_ts" | awk -F$'\037' 'NF > 1 { print $2 }' | sort -u)
+    files=$(printf '%s' "$files_raw" | sed 's/^/- /')
 
     # Commits / PRs from Bash commands
     local commits
@@ -706,6 +1078,104 @@ _harvest_one_jsonl() {
         | select(test("git commit|gh pr|gh issue"; "i"))
         | gsub("\n"; " ↵ ")
     ' "$jsonl" 2>/dev/null | sed 's/^/- /')
+
+    # ===== Event log =====
+    #
+    # Emitted from the values this function already computed, at the point it
+    # has them — no second pass over the transcript. Purely additive: nothing
+    # here changes a byte of the note written below. Stub sessions returned
+    # earlier, so they never reach this point.
+    #
+    # Set VAULT_NO_EVENTS=1 to harvest notes without touching the event log.
+    if [[ -z "${VAULT_NO_EVENTS:-}" ]]; then
+        local ev_dur="$duration_min"
+        [[ "$ev_dur" =~ ^[0-9]+$ ]] || ev_dur=0
+
+        local ev_payload
+        ev_payload=$(jq -cn \
+            --arg session_id "$sid" \
+            --arg title "$title" \
+            --arg first_ts "$first_ts" \
+            --arg last_ts "$last_ts" \
+            --arg transcript "$jsonl" \
+            --arg parent_session "$parent_sid" \
+            --arg agent_id "$agent_id" \
+            --argjson duration_min "$ev_dur" \
+            --argjson message_count "${msg_count:-0}" \
+            --argjson user_turns "${real_user_count:-0}" \
+            --argjson is_subagent "$is_subagent" \
+            '{session_id:$session_id, title:$title,
+              first_ts:$first_ts, last_ts:$last_ts,
+              duration_min:$duration_min, message_count:$message_count,
+              user_turns:$user_turns, transcript:$transcript,
+              is_subagent:$is_subagent}
+             + (if $parent_session == "" then {} else {parent_session:$parent_session} end)
+             + (if $agent_id == "" then {} else {agent_id:$agent_id} end)
+            ' 2>/dev/null) || ev_payload=""
+        # The id carries last_ts, not just the session id. A session harvested
+        # while it is still running would otherwise freeze at its first
+        # observation: dedup is by id, so the later harvest that sees a longer
+        # transcript is discarded as a duplicate and last_ts, duration,
+        # message_count and user_turns stay wrong forever, even though the
+        # markdown note updates. Including the end state means each distinct
+        # end state is appended once. Read the log by taking the newest event
+        # per payload.session_id.
+        if [[ -n "$ev_payload" ]]; then
+            _emit_event "session:$sid:$last_ts" "$first_ts" "claude-session" "observed" "$ev_payload" || true
+        fi
+
+        # One event per (cwd,branch) work segment. Interval-shaped on purpose:
+        # elapsed (union), effort (sum) and attention (AFK-filtered) are three
+        # different numbers derived from these same intervals, and collapsing
+        # them at capture would force a false choice about concurrency.
+        local seg_start seg_end seg_cwd seg_branch seg_payload seg_thread
+        while IFS=$'\037' read -r seg_start seg_end seg_cwd seg_branch; do
+            [[ -n "$seg_start" ]] || continue
+            # `thread` is the canonical repo root, so it joins across path forms
+            # and across sources (a commit event on the same repo carries the
+            # same value). `thread_branch` keeps the finer repo+branch key the
+            # design asks for, and the raw `cwd` is preserved either way —
+            # canonicalizing the key must not destroy what was observed.
+            seg_thread="$(_thread_key "$seg_cwd")"
+            seg_payload=$(jq -cn \
+                --arg session_id "$sid" \
+                --arg start "$seg_start" --arg end "$seg_end" \
+                --arg cwd "$seg_cwd" --arg branch "$seg_branch" \
+                --arg thread "$seg_thread" \
+                '{session_id:$session_id, start:$start, end:$end,
+                  cwd:$cwd, branch:$branch,
+                  thread:$thread, thread_branch:($thread + "@" + $branch)}
+                ' 2>/dev/null) || continue
+            # End included for the same reason as the session id: a segment that
+            # is still being extended must be able to supersede its own earlier
+            # observation. Take the newest per (session_id, start).
+            _emit_event "segment:$sid:$seg_start:$seg_end" "$seg_start" \
+                "claude-session" "observed" "$seg_payload" || true
+        done <<< "$segments_tsv"
+
+        # Artifacts are first-class rather than a field on the session: a file
+        # carries its own id and links back to what produced it, so "what was I
+        # doing" and "what came out of it" become one query from two directions.
+        # Timestamped at the write itself, not at session end, so a session
+        # running past midnight files each artifact on the day it was actually
+        # produced. The id is (session, path), so a file edited repeatedly keeps
+        # its FIRST write as its produced-at rather than accumulating events.
+        local art_ts art_path art_payload art_canon
+        while IFS=$'\037' read -r art_ts art_path; do
+            [[ -n "$art_path" ]] || continue
+            [[ -n "$art_ts" ]] || art_ts="$last_ts"
+            # Same file written from Windows and from WSL must be one artifact,
+            # so carry the canonical form alongside the path as observed.
+            art_canon="$(_canonical_path "$art_path")"
+            art_payload=$(jq -cn \
+                --arg path "$art_path" --arg session_id "$sid" --arg written_at "$art_ts" \
+                --arg canonical_path "$art_canon" \
+                '{path:$path, canonical_path:$canonical_path,
+                  produced_by:$session_id, written_at:$written_at}' 2>/dev/null) || continue
+            _emit_event "artifact:$sid:$art_path" "$art_ts" \
+                "claude-session" "observed" "$art_payload" || true
+        done <<< "$files_ts"
+    fi
 
     # Subagent wikilinks (parent only)
     local subagent_links=""
@@ -1107,7 +1577,11 @@ _collect_git_activity() {
     local output="" commit_count=0
     local -a repo_dirs=("${(@s/:/)REPOS_DIR}")
 
+    # Declared here rather than inside the loop: `local` inside the repo loop
+    # has bitten this function before (see "move all local declarations out of
+    # loops" in the history).
     local repo_name log count
+    local c_sha c_ts c_subject c_payload c_head_branch c_thread
 
     # Collect all git repos (up to 3 levels deep) from each search path
     local -a all_repos=()
@@ -1153,6 +1627,44 @@ _collect_git_activity() {
             count=$(echo "$log" | wc -l | tr -d ' ')
             commit_count=$((commit_count + count))
             output+="**$repo_name** ($count commits)\n$log\n\n"
+        fi
+
+        # Event log: the same commits, machine-readable. A separate `git log`
+        # call rather than reworking the one above, so the markdown stays
+        # byte-identical. %aI gives ISO-8601 with an explicit UTC offset, and
+        # the SHA is the natural content-derived id, so re-running backfill
+        # re-emits nothing. This function's stdout is redirected into the
+        # activity file that becomes the note body, so nothing added here may
+        # print to stdout — events are appended to their own file instead.
+        if [[ -z "${VAULT_NO_EVENTS:-}" ]]; then
+            # NOTE: this is the branch checked out *now*, not the branch the
+            # commit was made on — git cannot recover historical branch
+            # membership for a backfilled commit. Named accordingly so a query
+            # never mistakes it for ground truth; `repo` is the reliable key.
+            c_head_branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+            # Canonical repo root, matching what a session segment in this repo
+            # emits as its `thread` — this is the join between a conversation
+            # and the commits it produced.
+            c_thread="$(_thread_key "$repo")"
+            while IFS=$'\t' read -r c_sha c_ts c_subject; do
+                [[ -n "$c_sha" && -n "$c_ts" ]] || continue
+                case "$c_subject" in
+                    recap:*|weekly:*|backfill:*) continue ;;
+                esac
+                c_payload=$(jq -cn \
+                    --arg sha "$c_sha" \
+                    --arg repo "$repo_name" \
+                    --arg path "$repo" \
+                    --arg subject "$c_subject" \
+                    --arg head_branch "$c_head_branch" \
+                    --arg thread "$c_thread" \
+                    '{sha:$sha, repo:$repo, path:$path, subject:$subject,
+                      head_branch:$head_branch, thread:$thread}' 2>/dev/null) || continue
+                _emit_event "commit:$c_sha" "$c_ts" "git" "observed" "$c_payload" || true
+            done < <(git -C "$repo" log \
+                --after="${target_date}T00:00:00" \
+                --before="${target_date}T23:59:59" \
+                --pretty=format:"%H%x09%aI%x09%s" 2>/dev/null || true)
         fi
     done
 
