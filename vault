@@ -1628,19 +1628,27 @@ cmd_recap() {
     } > "$block_tmp"
     rm -f "$activity_tmp"
 
-    # Defuse any literal sentinel inside the generated body. Sources are spliced
-    # in verbatim — inbox captures, commit subjects, calendar titles, mail
-    # headers — so a source line equal to the terminator would end the block
-    # early on the next replace and leave the tail of the old block beside the
-    # new one. Same in-band delimiter problem the bare `---` had, just a rarer
-    # literal, and the reason the terminator alone cannot be trusted: it has to
-    # be the ONLY one in the block, which is enforced here rather than hoped for.
-    if grep -qxF "$RECAP_END" "$block_tmp" 2>/dev/null; then
-        awk -v e="$RECAP_END" '
-            $0 == e { print "<!-- /auto-recap [escaped: appeared in source text] -->"; next }
-            { print }
-        ' "$block_tmp" > "$block_tmp.esc" && mv "$block_tmp.esc" "$block_tmp"
-    fi
+    # Defuse BOTH structural markers inside the generated body. Sources are
+    # spliced in verbatim — inbox captures, commit subjects, calendar titles,
+    # mail headers — so either marker can occur in content:
+    #
+    #   * a line equal to the terminator ends the block early on the next
+    #     replace, leaving the tail of the old block beside the new one;
+    #   * a line opening `## Auto-Recap (` looks like the start of another
+    #     block, which makes a perfectly valid sentinel-terminated block read as
+    #     unterminated, so every refresh files another superseded copy and the
+    #     file never converges to one live block.
+    #
+    # This is the same in-band delimiter problem the bare `---` had. Narrowing
+    # the marker never made it unforgeable; the only durable fix is to guarantee
+    # the markers appear solely where this code emits them. Escaping is visible
+    # rather than silent, so nothing is quietly rewritten out of the record.
+    awk -v e="$RECAP_END" '
+        $0 == e { print "<!-- /auto-recap [escaped: appeared in source text] -->"; next }
+        # NR==1 is the block'"'"'s own header, emitted just above — never escape it.
+        NR > 1 && /^## Auto-Recap \(/ { print "`" $0 "` <!-- escaped: recap heading in source text -->"; next }
+        { print }
+    ' "$block_tmp" > "$block_tmp.esc" && mv "$block_tmp.esc" "$block_tmp"
 
     case "$mode" in
         fresh)

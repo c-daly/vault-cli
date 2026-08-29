@@ -415,6 +415,51 @@ else
     fi
 fi
 
+# === CHECK 10: a recap heading in source text must not force re-migration ===
+# A source line opening `## Auto-Recap (` would make a valid sentinel-terminated
+# block read as unterminated, so every refresh would file another superseded
+# copy and the file would never converge to one live block.
+cat > "$BIN_DIR/claude" <<'STUB'
+#!/usr/bin/env bash
+cat >/dev/null 2>&1 || true
+echo "quoting a recap header from another machine:"
+echo "## Auto-Recap (somebox)"
+echo "tail-after-heading"
+STUB
+chmod +x "$BIN_DIR/claude"
+
+rm -f "$RECAP_FILE" "${RECAP_FILE}.pre-recap.bak"
+run_recap 1 >/dev/null 2>&1
+run_recap 1 >/dev/null 2>&1
+run_recap 1 >/dev/null 2>&1
+
+if [[ ! -f "$RECAP_FILE" ]]; then
+    fail "check 10: recap file was not created"
+else
+    live=$(grep -c '^## Auto-Recap (' "$RECAP_FILE")
+    if [[ "$live" -eq 1 ]]; then
+        pass "check 10a: converges to one live block across three runs"
+    else
+        fail "check 10a: expected 1 live block, found $live"
+    fi
+    sup=$(grep -c 'superseded pre-sentinel recap' "$RECAP_FILE")
+    if [[ "$sup" -eq 0 ]]; then
+        pass "check 10b: no spurious legacy migration was triggered"
+    else
+        fail "check 10b: $sup superseded copies filed by re-migration"
+    fi
+    if grep -qF "escaped: recap heading in source text" "$RECAP_FILE"; then
+        pass "check 10c: the heading in source text was escaped"
+    else
+        fail "check 10c: heading in source text left as a live block header"
+    fi
+    if grep -qF "tail-after-heading" "$RECAP_FILE"; then
+        pass "check 10d: content after the embedded heading survived"
+    else
+        fail "check 10d: content after the embedded heading was lost"
+    fi
+fi
+
 # --- Verdict ----------------------------------------------------------------
 print -r -- ""
 if [[ "$fails" -eq 0 ]]; then
