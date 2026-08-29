@@ -343,7 +343,7 @@ _event_refresh_partition() {
 # reclaimed after two minutes. Giving up earlier and appending anyway is what
 # the caller must never do — see _emit_event.
 _event_lock() {
-    local lock="$1.lock" waited=0 holder=""
+    local lock="$1.lock" waited=0 holder="" rholder=""
     # `ln -s` is atomic AND records the owner in the SAME operation, so unlike
     # `mkdir` followed by a separate pid write there is never an instant where
     # the lock exists with no known holder. That gap was the last place an
@@ -377,8 +377,29 @@ _event_lock() {
 
         holder=$(readlink "$lock" 2>/dev/null) || holder=""
         if [[ -z "$holder" ]] || ! kill -0 "$holder" 2>/dev/null; then
-            # Holder is gone, or the link vanished under us. Clear and retry.
-            rm -f "$lock" 2>/dev/null || true
+            # Reaping must be serialized. Two waiters can observe the same dead
+            # holder at the same moment; if both then delete, the second removes
+            # the lock the first has just legitimately acquired and both enter
+            # the critical section — the duplicate this is all here to prevent.
+            #
+            # Only the waiter that wins `$lock.reap` may remove, and it re-reads
+            # under that right. The stale lock is still in place at that moment,
+            # so no new holder can have appeared in between.
+            if ln -s "$$" "$lock.reap" 2>/dev/null; then
+                holder=$(readlink "$lock" 2>/dev/null) || holder=""
+                if [[ -z "$holder" ]] || ! kill -0 "$holder" 2>/dev/null; then
+                    rm -f "$lock" 2>/dev/null || true
+                fi
+                rm -f "$lock.reap" 2>/dev/null || true
+            else
+                # Another waiter is reaping. Release its right only if it died.
+                rholder=$(readlink "$lock.reap" 2>/dev/null) || rholder=""
+                if [[ -n "$rholder" ]] && ! kill -0 "$rholder" 2>/dev/null; then
+                    rm -f "$lock.reap" 2>/dev/null || true
+                else
+                    sleep 0.2
+                fi
+            fi
         else
             sleep 0.2
         fi
