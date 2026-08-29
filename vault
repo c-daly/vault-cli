@@ -342,8 +342,41 @@ _event_refresh_partition() {
 # milliseconds (it spans one append), and a lock orphaned by a killed run is
 # reclaimed after two minutes. Giving up earlier and appending anyway is what
 # the caller must never do — see _emit_event.
+# Process start time, used to tell a live holder from a REUSED pid. `kill -0`
+# alone cannot: once a holder dies and the OS recycles its pid onto an unrelated
+# process, the lock reads as permanently held, every waiter times out, and the
+# partition silently loses events until that process happens to exit.
+#
+# Linux exposes it as field 22 of /proc/<pid>/stat; elsewhere `ps -o lstart=`
+# gives the same guarantee at second resolution. Empty when neither is
+# available, in which case the check degrades to pid-only — the previous
+# behaviour, not something worse.
+_proc_start() {
+    local p="$1" s=""
+    if [[ -r "/proc/$p/stat" ]]; then
+        s=$(awk '{print $22}' "/proc/$p/stat" 2>/dev/null) || s=""
+    else
+        s=$(ps -o lstart= -p "$p" 2>/dev/null | tr -s ' ' '_') || s=""
+    fi
+    printf '%s' "${s//[^0-9A-Za-z_:]/}"
+}
+
+# True when <pid>:<starttime> still identifies the same running process.
+_holder_alive() {
+    local rec="$1" p="${1%%:*}" want="${1#*:}" now
+    [[ -n "$p" ]] || return 1
+    kill -0 "$p" 2>/dev/null || return 1
+    [[ "$rec" == *:* ]] || return 0        # legacy pid-only record
+    now=$(_proc_start "$p")
+    # If the start time is unavailable we cannot distinguish reuse; treat the
+    # process as the holder rather than evicting a possibly-live writer.
+    [[ -z "$now" || -z "$want" ]] && return 0
+    [[ "$now" == "$want" ]]
+}
+
 _event_lock() {
     local lock="$1.lock" waited=0 holder="" rholder=""
+    local me="$$:$(_proc_start $$)"
     # `ln -s` is atomic AND records the owner in the SAME operation, so unlike
     # `mkdir` followed by a separate pid write there is never an instant where
     # the lock exists with no known holder. That gap was the last place an
@@ -362,7 +395,7 @@ _event_lock() {
         # nobody holds while the legacy holder is still writing.
         if [[ -d "$lock" && ! -L "$lock" ]]; then
             holder=$(cat "$lock/pid" 2>/dev/null) || holder=""
-            if [[ -z "$holder" ]] || ! kill -0 "$holder" 2>/dev/null; then
+            if [[ -z "$holder" ]] || ! _holder_alive "$holder"; then
                 rm -f "$lock/pid" 2>/dev/null || true
                 rmdir "$lock" 2>/dev/null || true
             else
@@ -373,10 +406,10 @@ _event_lock() {
             continue
         fi
 
-        ln -s "$$" "$lock" 2>/dev/null && return 0
+        ln -s "$me" "$lock" 2>/dev/null && return 0
 
         holder=$(readlink "$lock" 2>/dev/null) || holder=""
-        if [[ -z "$holder" ]] || ! kill -0 "$holder" 2>/dev/null; then
+        if [[ -z "$holder" ]] || ! _holder_alive "$holder"; then
             # Reaping must be serialized. Two waiters can observe the same dead
             # holder at the same moment; if both then delete, the second removes
             # the lock the first has just legitimately acquired and both enter
@@ -385,16 +418,16 @@ _event_lock() {
             # Only the waiter that wins `$lock.reap` may remove, and it re-reads
             # under that right. The stale lock is still in place at that moment,
             # so no new holder can have appeared in between.
-            if ln -s "$$" "$lock.reap" 2>/dev/null; then
+            if ln -s "$me" "$lock.reap" 2>/dev/null; then
                 holder=$(readlink "$lock" 2>/dev/null) || holder=""
-                if [[ -z "$holder" ]] || ! kill -0 "$holder" 2>/dev/null; then
+                if [[ -z "$holder" ]] || ! _holder_alive "$holder"; then
                     rm -f "$lock" 2>/dev/null || true
                 fi
                 rm -f "$lock.reap" 2>/dev/null || true
             else
                 # Another waiter is reaping. Release its right only if it died.
                 rholder=$(readlink "$lock.reap" 2>/dev/null) || rholder=""
-                if [[ -n "$rholder" ]] && ! kill -0 "$rholder" 2>/dev/null; then
+                if [[ -n "$rholder" ]] && ! _holder_alive "$rholder"; then
                     rm -f "$lock.reap" 2>/dev/null || true
                 else
                     sleep 0.2
