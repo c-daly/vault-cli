@@ -323,6 +323,50 @@ else
 fi
 rm -f "$AI_SESSION"
 
+# === CHECK 7: source text equal to the sentinel cannot terminate the block ==
+# Generated sources are spliced in verbatim, so a source line equal to the
+# terminator would end the block early on the next replace. Exercised by making
+# the narrator emit the sentinel, which lands in `## Summary` unmodified.
+cat > "$BIN_DIR/claude" <<STUB
+#!/usr/bin/env bash
+cat >/dev/null 2>&1 || true
+echo "before-sentinel"
+echo "$STUB_END"
+echo "after-sentinel"
+STUB
+chmod +x "$BIN_DIR/claude"
+
+rm -f "$RECAP_FILE"
+run_recap 1 >/dev/null 2>&1          # fresh
+run_recap 1 >/dev/null 2>&1          # replace — where an early terminator would bite
+
+if [[ ! -f "$RECAP_FILE" ]]; then
+    fail "check 7: recap file was not created"
+else
+    real_ends=$(grep -cxF "$STUB_END" "$RECAP_FILE")
+    if [[ "$real_ends" -eq 1 ]]; then
+        pass "check 7a: exactly one live sentinel in the file"
+    else
+        fail "check 7a: expected 1 live sentinel, found $real_ends"
+    fi
+    if grep -qF "escaped: appeared in source text" "$RECAP_FILE"; then
+        pass "check 7b: the sentinel occurring in source text was defused"
+    else
+        fail "check 7b: source sentinel was left live in the block"
+    fi
+    if grep -qF "after-sentinel" "$RECAP_FILE"; then
+        pass "check 7c: block content past the embedded sentinel survived"
+    else
+        fail "check 7c: block was truncated at the embedded sentinel"
+    fi
+    blocks=$(grep -c '^## Auto-Recap (' "$RECAP_FILE")
+    if [[ "$blocks" -eq 1 ]]; then
+        pass "check 7d: still exactly one block after the replace"
+    else
+        fail "check 7d: expected 1 block, found $blocks"
+    fi
+fi
+
 # --- Verdict ----------------------------------------------------------------
 print -r -- ""
 if [[ "$fails" -eq 0 ]]; then

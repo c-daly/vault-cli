@@ -1628,6 +1628,20 @@ cmd_recap() {
     } > "$block_tmp"
     rm -f "$activity_tmp"
 
+    # Defuse any literal sentinel inside the generated body. Sources are spliced
+    # in verbatim — inbox captures, commit subjects, calendar titles, mail
+    # headers — so a source line equal to the terminator would end the block
+    # early on the next replace and leave the tail of the old block beside the
+    # new one. Same in-band delimiter problem the bare `---` had, just a rarer
+    # literal, and the reason the terminator alone cannot be trusted: it has to
+    # be the ONLY one in the block, which is enforced here rather than hoped for.
+    if grep -qxF "$RECAP_END" "$block_tmp" 2>/dev/null; then
+        awk -v e="$RECAP_END" '
+            $0 == e { print "<!-- /auto-recap [escaped: appeared in source text] -->"; next }
+            { print }
+        ' "$block_tmp" > "$block_tmp.esc" && mv "$block_tmp.esc" "$block_tmp"
+    fi
+
     case "$mode" in
         fresh)
             # Always write the `## Auto-Recap (HOST)` wrapper, even on
