@@ -25,7 +25,25 @@ VAULT_DIR="~/projects/vault"
 # Daily narrative (LLM diary summary; NARRATE=0 disables)
 NARRATE=1
 NARRATE_MODEL="haiku"
+# NARRATE_TIMEOUT=60
+
+# The narrator shells out to `claude -p`, which leaves a session transcript like
+# any other run. It is run from this directory so those transcripts land in one
+# predictable Claude project dir that `harvest` skips — otherwise the summarizer's
+# own output is ingested as if it were your work.
+# VAULT_NARRATE_CWD="${TMPDIR:-/tmp}/vault-cli-narrate"
+
+# Gmail IMAP socket timeout, seconds. Without it a blackholed connection hangs
+# the whole recap instead of degrading to the "unavailable" note.
+# GMAIL_TIMEOUT=20
 
 # Gmail diary source: app-password IMAP; leave empty to disable
 VAULT_GMAIL_USER=""
 VAULT_GMAIL_APP_PASSWORD=""
+
+# Event log: an append-only JSONL record written alongside the markdown notes by
+# `harvest` and `recap`. Defaults to $VAULT_DIR/events, so it rides the existing
+# `vault sync` with no extra plumbing. Point it elsewhere to keep it out of the
+# vault, or set VAULT_NO_EVENTS=1 to write notes without touching the log.
+# VAULT_EVENTS_DIR="$VAULT_DIR/events"
+# VAULT_NO_EVENTS=1

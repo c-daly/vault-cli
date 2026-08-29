@@ -13,6 +13,7 @@ _vault() {
         'recent:Show recently modified notes'
         'recap:Auto-generate daily recap from activity'
         'weekly:Weekly rollup from daily recaps'
+        'backfill:Generate recaps for every past date with activity'
         'help:Show help'
     )
 

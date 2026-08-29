@@ -37,6 +37,16 @@ Obsidian is great for linking and visualizing notes, but opening a GUI app to jo
    The auto-memory mirror is verbatim and read-only. Claude's built-in store is keyed by working directory and has no `subject` field, so an entry can be *about the user* yet live under whichever project it was learned in. The mirror preserves that rather than guessing a subject; curating across projects belongs to the continuity plugin.
 3. Activity collection: shell history (`$HISTFILE`), git commit log across `$VAULT_REPOS_DIR` (default `~/projects`), GitHub PRs/issues via `gh`, today's captures from `00-inbox/`, Claude session summaries (local-day bucketing), and calendar entries if `gcalcli` is installed.
 4. Writes the recap markdown to `journal/<date>.md`. First run for a date writes in *fresh* mode (unwrapped); subsequent runs splice an `## Auto-Recap (<host>)` wrapped block in *replace* or *append* mode.
+5. Appends the same activity to the [event log](#event-log).
+
+#### Why the block has an explicit terminator
+
+An `## Auto-Recap (<host>)` block ends at `<!-- /auto-recap -->`, and replace mode splices only up to that marker. It exists because the block's own sources are embedded verbatim — inbox captures, commit subjects, calendar titles, mail headers — so any in-band delimiter can occur inside the content it is supposed to bound. A bare `---` was the original terminator and a capture containing one truncated the block.
+
+Two consequences worth knowing:
+
+- **Both markers are escaped in generated content.** A source line equal to the terminator, or one opening `## Auto-Recap (`, is rewritten to a visibly escaped form, so the markers only ever appear where the tool emits them. Escaping is visible in the note rather than silent.
+- **Pre-sentinel blocks are migrated, not guessed at.** A block written before the terminator existed has no unambiguous end. It is not spliced: the new block is written, the old region is preserved verbatim beneath a marker with its header neutralized to `## (superseded) Auto-Recap (<host>)`, and a `.pre-recap.bak` is kept. Nothing is deleted; the duplication is explicit, one-time, and converges on the next run once you delete the marked region.
 
 The recap **does not commit or push.** Run `vault sync` when you want the changes published. Same for `weekly` and `backfill`.
 
@@ -125,7 +135,42 @@ vault harvest --project LOGOS    # filter by project name
 vault harvest --sync             # harvest + sync in one
 ```
 
-Reads `~/.claude/projects/*/sessions-index.json` and creates a markdown note per session with summary, first prompt, duration, and a link to the full JSONL transcript.
+Walks the session transcripts under every root in `VAULT_CLAUDE_DIRS` (default `~/.claude/projects`) and creates a markdown note per session with summary, first prompt, duration, and a link to the full JSONL transcript. It does not depend on `sessions-index.json`, which Claude Code 2.x no longer writes.
+
+Two kinds of transcript are skipped and reported in the summary line: **stubs** (sessions with no genuine typed input) and **narrator** runs — the `claude -p` calls the daily narrative makes, which would otherwise be ingested as if they were your own sessions.
+
+## Event log
+
+Alongside the markdown, `harvest` and `recap` append a machine-readable record:
+
+```
+$VAULT_DIR/events/<host>/YYYY-MM.jsonl
+```
+
+Notes are a rendered view; this is the thing they are a view *of*. Nothing here parses a note — events come from the session transcripts and from git directly — so the note format stays free to change without breaking a query.
+
+One JSON object per line, with a deliberately narrow envelope and an opaque source-specific `payload`:
+
+```json
+{"id":"session:5c66eace…:2026-06-30T21:48:32Z","ts":"…","local_date":"2026-06-30",
+ "host":"PROMETHEUS","source":"claude-session","tier":"observed","payload":{…}}
+```
+
+| id | what it records |
+|---|---|
+| `session:<sid>:<last_ts>` | a work session — duration, turns, title |
+| `segment:<sid>:<start>:<end>` | a `(cwd, branch)` interval within it |
+| `artifact:<sid>:<path>` | a file written, stamped at the write |
+| `commit:<sha>` | a commit, from the git scan |
+
+Four properties worth knowing:
+
+- **Per-host directories.** Two machines appending on the same day touch different files, so `vault sync`'s `pull --rebase` stays a fast-forward and no host's writes are lost.
+- **Content-derived ids, per-event dedup.** `backfill` re-derives every date on every run; dedup is what makes that converge instead of doubling history. Ids carry end state, so a session harvested while still running can supersede its own earlier observation — read the log by taking the newest event per `payload.session_id`.
+- **Machine-independent thread keys.** `payload.thread` is the repo's identity derived from its origin remote (`github.com/owner/repo`), not a path, so the same repo joins across clones and machines. A directory with no remote falls back to a deliberately host-scoped key. The raw `cwd`/`path` is always kept alongside.
+- **Derivations are versioned, not migrated.** If the derivation changes, regenerate rather than rewriting: filter each partition to `select(.source=="git")` and re-run `harvest` (which does not narrate), then `backfill` for commits.
+
+Set `VAULT_NO_EVENTS=1` to write notes without touching the log, or `VAULT_EVENTS_DIR` to keep it outside the vault.
 
 ## Vault structure
 
@@ -139,8 +184,11 @@ vault/
 ├── 30-resources/      # Reference materials
 ├── 40-archive/        # Archived content
 ├── journal/           # Daily notes
+├── events/            # Append-only event log, per host (see above)
 └── _templates/        # Note templates (daily.md, project.md, fleeting.md, learning.md)
 ```
+
+`harvest` also writes session notes to `30-resources/claude-sessions/YYYY-MM/` and mirrors Claude's built-in auto-memory to `30-resources/claude-memory/`.
 
 Templates use Obsidian's `{{date}}` and `{{title}}` syntax. If a template doesn't exist, a sensible default is used.
 
@@ -203,7 +251,30 @@ VAULT_REPOS_DIR="$HOME/projects"
 
 # Recap: enable Google Calendar (requires gcalcli)
 VAULT_GCAL_ENABLED="true"
+
+# Recap/harvest source roots. Colon-separated, non-existent roots skipped, so
+# one config works across machines. Needed on WSL to see Windows-side repos and
+# sessions started from PowerShell — the defaults only look at $HOME.
+VAULT_REPOS_DIR="$HOME/projects:/mnt/c/Users/<user>"
+VAULT_CLAUDE_DIRS="$HOME/.claude/projects:/mnt/c/Users/<user>/.claude/projects"
+
+# Daily narrative (LLM diary summary)
+NARRATE=1                 # 0 disables
+NARRATE_MODEL="haiku"
+NARRATE_TIMEOUT=60
+VAULT_NARRATE_CWD="${TMPDIR:-/tmp}/vault-cli-narrate"   # narrator transcripts land here, and harvest skips them
+
+# Gmail diary source (app-password IMAP; empty disables)
+VAULT_GMAIL_USER=""
+VAULT_GMAIL_APP_PASSWORD=""
+GMAIL_TIMEOUT=20          # socket timeout, else a stalled server hangs the recap
+
+# Event log
+VAULT_EVENTS_DIR="$VAULT_DIR/events"
+VAULT_NO_EVENTS=1         # write notes without touching the log
 ```
+
+See `config.example` for the same set with commentary.
 
 ## License
 
