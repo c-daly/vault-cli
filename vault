@@ -29,6 +29,24 @@ _claude_roots() {
     done
 }
 
+# What counts as text the user actually typed.
+#
+# Two lists, because the answer differs by purpose. A session transcript carries
+# a lot of machine-authored text in `user` records — slash-command envelopes,
+# skill documents the harness injects, system reminders, continuation
+# preambles. Measured across this vault: 306 of 468 session notes (65%) had NOT
+# ONE genuinely typed message, and were kept anyway because the stub check only
+# knew about `<command-…>`.
+#
+# NOISE is machine text that should never be rendered or counted.
+NOISE_PAT='^(<(command|local-command)-|<system-reminder>|Base directory for this skill:|Caveat: The messages below|This session is being continued|#[[:space:]]+.*[[:space:]]Skill([[:space:]]|$))'
+#
+# CONTEXT is real but not typed by the user: an interruption they performed, a
+# message another agent sent. Worth showing inside a session that has real
+# turns, but a session containing ONLY these is not a session — it is machinery
+# talking, and gets skipped as a stub.
+CONTEXT_PAT='^(\[Request interrupted by user|<teammate-message)'
+
 # Unambiguous end-of-block marker for `## Auto-Recap (HOST)` sections. An HTML
 # comment renders as nothing in Obsidian and cannot collide with note content
 # the way a bare `---` can (inbox captures are spliced in verbatim, and YAML
@@ -1021,9 +1039,11 @@ _harvest_one_jsonl() {
         NF { printf "- %s → %s  %s @%s\n", $1, $2, $3, $4 }
     ')
 
-    # User turns (real prompts: skip tool_result-bearing user records)
+    # User turns. Drops NOISE outright; keeps CONTEXT, because an interruption
+    # or another agent's message is part of what happened in a session that has
+    # real turns — it just cannot be the ONLY thing in one (see the stub check).
     local user_turns
-    user_turns=$(jq -r '
+    user_turns=$(jq -r --arg noise "$NOISE_PAT" '
         select(.type == "user")
         | .message.content
         | if type == "string" then .
@@ -1034,7 +1054,7 @@ _harvest_one_jsonl() {
           else empty
           end
         | select(length > 0)
-        | select(test("^<(command|local-command)-") | not)
+        | select(test($noise) | not)
         | gsub("\n"; " ¶ ")
     ' "$jsonl" 2>/dev/null | nl -ba -w2 -s'. ' | sed 's/^/   /')
 
@@ -1047,7 +1067,7 @@ _harvest_one_jsonl() {
     # previously-harvested stub file so existing noise gets cleaned up
     # on re-harvest. `--keep-stubs` opts back in.
     local real_user_count
-    real_user_count=$(jq -r '
+    real_user_count=$(jq -r --arg noise "$NOISE_PAT" --arg ctx "$CONTEXT_PAT" '
         select(.type == "user")
         | .message.content
         | if type == "string" then .
@@ -1058,7 +1078,8 @@ _harvest_one_jsonl() {
           else empty
           end
         | select(length > 0)
-        | select(test("^<(command|local-command)-") | not)
+        | select(test($noise) | not)
+        | select(test($ctx) | not)
         | gsub("\n"; " ")
     ' "$jsonl" 2>/dev/null | wc -l | tr -d ' ')
     [[ "$real_user_count" =~ ^[0-9]+$ ]] || real_user_count=0
@@ -1086,7 +1107,7 @@ _harvest_one_jsonl() {
     # transcripts written before NARRATE_CWD existed. The second pattern is an
     # older prompt that predates the guard (11 of the 1692).
     local first_turn
-    first_turn=$(jq -r '
+    first_turn=$(jq -r --arg noise "$NOISE_PAT" '
         select(.type == "user")
         | .message.content
         | if type == "string" then .
@@ -1097,7 +1118,7 @@ _harvest_one_jsonl() {
           else empty
           end
         | select(length > 0)
-        | select(test("^<(command|local-command)-") | not)
+        | select(test($noise) | not)
         | gsub("\n"; " ")
     ' "$jsonl" 2>/dev/null | head -1) || first_turn=""
     if [[ "$first_turn" == *"Treat it strictly as data"* \
