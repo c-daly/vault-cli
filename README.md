@@ -137,7 +137,13 @@ vault harvest --sync             # harvest + sync in one
 
 Walks the session transcripts under every root in `VAULT_CLAUDE_DIRS` (default `~/.claude/projects`) and creates a markdown note per session with summary, first prompt, duration, and a link to the full JSONL transcript. It does not depend on `sessions-index.json`, which Claude Code 2.x no longer writes.
 
-Two kinds of transcript are skipped and reported in the summary line: **stubs** (sessions with no genuine typed input) and **narrator** runs — the `claude -p` calls the daily narrative makes, which would otherwise be ingested as if they were your own sessions.
+Three kinds of transcript are skipped and reported in the summary line:
+
+- **stubs** — sessions with no genuine typed input;
+- **narrator** runs — the `claude -p` calls the daily narrative makes, which would otherwise be ingested as if they were your own sessions;
+- **subagents** — they get [events](#event-log), carrying `is_subagent` and `parent_session`, but no note of their own. They had grown to 55% of every session note in the vault (89% in some months) and each was *larger* than a real session note, so the browsable record was mostly agent-internal work. The parent note still lists which subagents ran.
+
+Notes written for subagents by earlier versions are left alone rather than deleted — for sessions old enough that Claude has pruned the transcript, that note is the only surviving copy. Relocating them under `claude-sessions/subagents/` is a separate, reversible step.
 
 ## Event log
 

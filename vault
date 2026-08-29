@@ -1210,18 +1210,31 @@ _harvest_one_jsonl() {
         done <<< "$files_ts"
     fi
 
-    # Subagent wikilinks (parent only)
+    # A subagent gets its EVENTS (emitted above, carrying is_subagent and
+    # parent_session) but no note of its own. Subagent transcripts had grown to
+    # 55% of every session note in the vault — 89% in some months — and each was
+    # larger than a real session note, so the browsable record was mostly
+    # agent-internal work. The parent note below still says which subagents ran.
+    #
+    # Deliberately does NOT delete a note written by an earlier version: for
+    # sessions old enough that Claude has pruned the transcript, that note is
+    # the only surviving copy. Relocating those is a separate, reversible step.
+    if $is_subagent; then
+        return 4
+    fi
+
+    # Subagents that ran under this session. Listed rather than wikilinked,
+    # because notes are no longer written for them and a link to a file that
+    # does not exist is just another kind of noise.
     local subagent_links=""
-    if ! $is_subagent; then
-        local subdir="$(dirname "$jsonl")/$sid/subagents"
-        if [[ -d "$subdir" ]]; then
-            local sf aid
-            for sf in "$subdir"/agent-*.jsonl(N); do
-                aid="$(basename "$sf" .jsonl)"
-                aid="${aid#agent-}"
-                subagent_links+="- [[${date}-${sid:0:8}--agent-${aid:0:8}]]"$'\n'
-            done
-        fi
+    local subdir="$(dirname "$jsonl")/$sid/subagents"
+    if [[ -d "$subdir" ]]; then
+        local sf aid
+        for sf in "$subdir"/agent-*.jsonl(N); do
+            aid="$(basename "$sf" .jsonl)"
+            aid="${aid#agent-}"
+            subagent_links+="- ${aid}"$'\n'
+        done
     fi
 
     # ===== Compose frontmatter =====
@@ -1267,9 +1280,9 @@ _harvest_one_jsonl() {
         if [[ -n "$commits" ]]; then printf '%s\n' "$commits"; else printf '_(none)_\n'; fi
         printf '\n'
 
-        if $is_subagent; then
-            printf '## Parent session\n[[%s-%s]]\n' "$date" "${parent_sid:0:8}"
-        elif [[ -n "$subagent_links" ]]; then
+        # No `## Parent session` branch: subagents return before this point and
+        # never reach note composition.
+        if [[ -n "$subagent_links" ]]; then
             printf '## Subagents\n%s' "$subagent_links"
         fi
     })
@@ -1420,7 +1433,7 @@ cmd_harvest() {
     local hostname
     hostname="$(vault_hostname)"
 
-    local updated=0 unchanged=0 errors=0 stubs=0 scanned=0 narrator=0
+    local updated=0 unchanged=0 errors=0 stubs=0 scanned=0 narrator=0 subagents=0
 
     local jsonl rc
     while IFS= read -r -d '' jsonl; do
@@ -1446,11 +1459,12 @@ cmd_harvest() {
             0) updated=$((updated+1)) ;;
             1) unchanged=$((unchanged+1)) ;;
             3) stubs=$((stubs+1)) ;;
+            4) subagents=$((subagents+1)) ;;
             *) errors=$((errors+1)) ;;
         esac
     done < <(find "${claude_dirs[@]}" -name "*.jsonl" -type f -print0 2>/dev/null)
 
-    echo "Harvested: $updated updated, $unchanged unchanged, $stubs stubs skipped, $narrator narrator skipped, $errors errors ($scanned scanned)"
+    echo "Harvested: $updated updated, $unchanged unchanged, $stubs stubs skipped, $subagents subagents skipped, $narrator narrator skipped, $errors errors ($scanned scanned)"
 
     # Runs by default so the nightly recap picks memory up without extra config;
     # it is cheap next to the transcript scan. --no-memory opts out.
