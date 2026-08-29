@@ -55,13 +55,28 @@ HIST_FILE_T="$SANDBOX/empty-history"   # intentionally absent
 PROJECTS_DIR="$FAKE_HOME/.claude/projects"
 PROJECT_NAME="-home-fearsidhe-projects-logos-workspace"
 
-mkdir -p "$FAKE_HOME" "$VAULT_DIR_T" "$REPOS_DIR_T" "$BIN_DIR" \
-         "$PROJECTS_DIR/$PROJECT_NAME"
+# Narrator cwd, inside the sandbox so the assertion below can pin it exactly.
+NARRATE_CWD_T="$SANDBOX/narrate"
 
-# --- STUB `claude`: ignore args, print a fixed marker line ------------------
+mkdir -p "$FAKE_HOME" "$VAULT_DIR_T" "$REPOS_DIR_T" "$BIN_DIR" \
+         "$NARRATE_CWD_T" "$PROJECTS_DIR/$PROJECT_NAME"
+
+# --- STUB `claude`: record the invocation, print a fixed marker line --------
+# It records argv and cwd rather than ignoring them. Both `--tools ""` and the
+# dedicated narrate cwd are load-bearing and silently reversible: without this,
+# deleting either leaves every check in this file passing, while the summarizer
+# regains the ability to act on the transcript it was asked to summarize (which
+# is how it once recursed into `vault backfill` and pushed the vault unasked).
+CLAUDE_STUB_LOG="$SANDBOX/claude-invocations.log"
 cat > "$BIN_DIR/claude" <<'STUB'
 #!/usr/bin/env bash
-# Deterministic stub: ignore all args/flags/stdin, emit one fixed line.
+if [[ -n "${CLAUDE_STUB_LOG:-}" ]]; then
+    {
+        printf 'CWD=%s\n' "$PWD"
+        for a in "$@"; do printf 'ARG=%s\n' "$a"; done
+        printf 'END\n'
+    } >> "$CLAUDE_STUB_LOG"
+fi
 cat >/dev/null 2>&1 || true
 echo "STUB-SUMMARY-MARKER"
 STUB
@@ -111,6 +126,8 @@ run_recap() {
         NARRATE="$narrate" \
         NARRATE_MODEL="haiku" \
         NARRATE_TIMEOUT="30" \
+        CLAUDE_STUB_LOG="$CLAUDE_STUB_LOG" \
+        VAULT_NARRATE_CWD="$NARRATE_CWD_T" \
         TERM="dumb" \
         zsh "$VAULT_BIN" recap "$TARGET_DATE" </dev/null
 }
@@ -322,6 +339,40 @@ else
     fi
 fi
 rm -f "$AI_SESSION"
+# === CHECK 8: the narrator is invoked with no tools, from the narrate cwd ===
+# Regression cover for two containment guarantees that are otherwise invisible
+# to this suite. `--tools ""` is what stops the summarizer acting on the
+# transcript it summarizes; running from NARRATE_CWD is what keeps its own
+# `claude -p` transcripts out of the harvest. Deleting either used to leave
+# every check green.
+rm -f "$RECAP_FILE" "$CLAUDE_STUB_LOG"
+run_recap 1 >/dev/null 2>&1
+
+if [[ ! -s "$CLAUDE_STUB_LOG" ]]; then
+    fail "check 8: the narrator was never invoked, so containment is untested"
+else
+    if grep -qxF 'ARG=--tools' "$CLAUDE_STUB_LOG"; then
+        pass "check 8a: narrator invoked with --tools"
+    else
+        fail "check 8a: narrator invoked WITHOUT --tools (tool restriction lost)"
+    fi
+
+    # The value must be the empty string: `--tools` followed by anything else
+    # would re-enable that toolset.
+    if awk '/^ARG=--tools$/ { getline nxt; if (nxt == "ARG=") ok = 1 } END { exit ok ? 0 : 1 }' \
+           "$CLAUDE_STUB_LOG"; then
+        pass "check 8b: --tools value is empty (all tools disabled)"
+    else
+        fail "check 8b: --tools was not followed by an empty value"
+    fi
+
+    if grep -qxF "CWD=$NARRATE_CWD_T" "$CLAUDE_STUB_LOG"; then
+        pass "check 8c: narrator ran from VAULT_NARRATE_CWD"
+    else
+        fail "check 8c: narrator did not run from VAULT_NARRATE_CWD"
+        grep -m1 '^CWD=' "$CLAUDE_STUB_LOG"
+    fi
+fi
 
 # === CHECK 7: source text equal to the sentinel cannot terminate the block ==
 # Generated sources are spliced in verbatim, so a source line equal to the
