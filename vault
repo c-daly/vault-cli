@@ -1051,36 +1051,43 @@ _harvest_one_jsonl() {
     # while 10+ rendered as a list, in the same section.
     local user_turns
     user_turns=$(jq -j --arg noise "$NOISE_PAT" '
-        select(.type == "user")
-        | .message.content
-        | if type == "string" then .
-          elif type == "array" then
-            if any(.type == "tool_result") then empty
-            else ([.[] | select(.type == "text") | .text] | join("\n"))
-            end
-          else empty
-          end
-        | select(length > 0)
-        | select(test($noise) | not)
-        # Escape `<` so tag-shaped text stays visible. Markdown treats a raw
-        # `<bash-input>` as HTML and renders nothing at all, which silently
-        # deletes real content from the page — 1838 turn lines carried
-        # angle-bracket text. `&lt;` displays as `<`.
-        | gsub("<"; "&lt;")
-        # Records separated by US, newlines KEPT. Collapsing a turn to one line
-        # with a `¶` made a long paste an unreadable wall of several thousand
-        # characters; the structure the user typed is worth preserving.
-        | ., "\u001f"
+        if .type == "assistant" then
+            ((.message.content // [])
+             | if type == "array" then ([.[] | select(.type == "text") | .text] | join("\n"))
+               else empty end)
+            | select(length > 0)
+            | "claude\u001e" + gsub("<"; "&lt;") + "\u001f"
+        else
+            select(.type == "user")
+            | .message.content
+            | if type == "string" then .
+              elif type == "array" then
+                if any(.type == "tool_result") then empty
+                else ([.[] | select(.type == "text") | .text] | join("\n"))
+                end
+              else empty
+              end
+            | select(length > 0)
+            | select(test($noise) | not)
+            # Escape `<` so tag-shaped text stays visible. Markdown treats a raw
+            # `<bash-input>` as HTML and renders nothing at all, which silently
+            # deletes real content from the page — 1838 turn lines carried
+            # angle-bracket text. `&lt;` displays as `<`.
+            | gsub("<"; "&lt;")
+            # Records separated by US, newlines KEPT. Collapsing a turn to one line
+            # with a `¶` made a long paste an unreadable wall of several thousand
+            # characters; the structure the user typed is worth preserving.
+            | "you\u001e" + . + "\u001f"
+        end
     ' "$jsonl" 2>/dev/null | awk -v RS=$'\037' '
-        { sub(/\n+$/, "") }
-        /[^[:space:]]/ {
-            n++
-            m = split($0, L, "\n")
-            printf "%d. %s\n", n, L[1]
-            # Continuation lines indent to the item content column, so the turn
-            # stays one list item instead of breaking into separate blocks.
-            pad = substr("          ", 1, length(n) + 2)
-            for (k = 2; k <= m; k++) printf "%s%s\n", pad, L[k]
+        {
+            i = index($0, "\036")
+            if (i == 0) next
+            role = substr($0, 1, i - 1)
+            body = substr($0, i + 1)
+            gsub(/^\n+|\n+$/, "", body)
+            if (body == "") next
+            printf "**%s**\n%s\n\n", (role == "you" ? "You" : "Claude"), body
         }
     ')
 
@@ -1363,7 +1370,7 @@ _harvest_one_jsonl() {
         if [[ -n "$segments" ]]; then printf '%s\n' "$segments"; else printf '_(none captured)_\n'; fi
         printf '\n'
 
-        printf '## User turns\n'
+        printf '## Conversation\n'
         if [[ -n "$user_turns" ]]; then printf '%s\n' "$user_turns"; else printf '_(none)_\n'; fi
         printf '\n'
 
